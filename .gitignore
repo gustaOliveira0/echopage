@@ -2,3 +2,7 @@
 clones/
 *.json
 !package.json
+
+# cache do Python
+__pycache__/
+*.pyc
