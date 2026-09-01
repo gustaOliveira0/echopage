@@ -1,0 +1,4 @@
+# clones gerados e capturas — pesados, não versionar
+clones/
+*.json
+!package.json
