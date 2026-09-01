@@ -37,6 +37,16 @@
   document.querySelectorAll('[style*="url("]').forEach(el =>
     [...el.getAttribute('style').matchAll(/url\(['"]?([^'")]+)/g)].forEach(m => add(m[1])));
 
+  // ── 2b. varredura por regex no HTML cru ──────────────────────
+  // Pega o que querySelectorAll não enxerga: conteúdo de <noscript>
+  // (é texto inerte quando o JS está ligado), <template>, e atributos
+  // exóticos. Foi assim que um selo DMCA escapou de uma captura.
+  {
+    const cru = document.documentElement.outerHTML;
+    for (const m of cru.matchAll(/(?:src|href|data-src|data-lazy-src)=["']([^"']+)["']/g)) add(m[1]);
+    for (const m of cru.matchAll(/url\(\s*['"]?(?!data:)([^'")]+)/g)) add(m[1]);
+  }
+
   // ── 3. CSS: extrai backgrounds e @font-face de dentro ─────────
   const seenCss = new Set();
   for (let round = 0; round < 2; round++) {          // 2 níveis (@import)

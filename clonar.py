@@ -13,6 +13,35 @@ from urllib.parse import urlsplit, unquote
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+
+
+def baixar_url(url, referer=None, timeout=25):
+    """Baixa uma URL e descomprime a resposta.
+
+    Servidores mandam gzip mesmo sem pedirmos; sem descomprimir, o HTML
+    vira bytes binários e a varredura de assets não acha nada.
+    """
+    import gzip, zlib, urllib.request
+    h = {"User-Agent": UA, "Accept": "*/*",
+         "Accept-Language": "en-US,en;q=0.9",
+         "Accept-Encoding": "gzip, deflate"}
+    if referer:
+        h["Referer"] = referer
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        dados = r.read()
+        enc = (r.headers.get("Content-Encoding") or "").lower()
+        if enc == "gzip":
+            dados = gzip.decompress(dados)
+        elif enc == "deflate":
+            try:
+                dados = zlib.decompress(dados)
+            except zlib.error:
+                dados = zlib.decompress(dados, -zlib.MAX_WBITS)
+        return dados, r.headers.get("Content-Type", "")
+
 # Scripts que NÃO devem rodar no clone (rastreamento / lixo de extensão).
 TRACKER_SRC = [
     "chrome-extension://", "moz-extension://", "googletagmanager", "google-analytics",
@@ -25,6 +54,8 @@ TRACKER_SRC = [
     # o domínio é do cliente, então só o nome do arquivo entrega.
     "/static/array.js", "/static/surveys.js", "/static/dead-clicks",
     "/static/recorder", "/i/v0/e/", "/e/?ip=", "gtm.js", "gtag/js",
+    "convert_tracking", "checktrafficnew", "/ajax.php/extensions",
+    "facebook.com/tr", "/pagead/viewthroughconversion", "/signals/config",
 ]
 TRACKER_INLINE = [
     "dataLayer", "gtag(", "posthog.init", "__CF$cv", "_conv_q", "window.convert",
@@ -58,6 +89,19 @@ def nome_local(url, meta, usados):
     return base
 
 
+def trocar(html, alvo, novo):
+    """Troca `alvo` por `novo` só quando ele é um valor INTEIRO.
+
+    Substring solta é perigosa: a variante curta de uma URL ("/default")
+    casa dentro de um caminho já resolvido ("assets/x_index"), produzindo
+    "assets/x_indexassets/y_default". Exigir delimitador dos dois lados
+    (aspas, parênteses, vírgula, espaço) elimina isso — e ainda cobre
+    srcset, que é uma lista separada por vírgula.
+    """
+    padrao = r'(?<=["\'(,\s])' + re.escape(alvo) + r'(?=["\')\s,])'
+    return re.subn(padrao, novo.replace("\\", "\\\\"), html)
+
+
 def variantes(url):
     """Todas as formas em que essa URL pode aparecer no HTML."""
     sp = urlsplit(url)
@@ -86,18 +130,12 @@ def completar_externos(html, assets, out):
     dá para fechar o buraco aqui — inclusive fontes, deixando o clone 100%
     offline.
     """
-    import urllib.request
     from urllib.parse import urljoin
 
-    UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
-
-    def baixar(url):
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return r.read(), r.headers.get("Content-Type", "")
+    baixar = baixar_url
 
     usados = {f: None for f in os.listdir(assets)}
+    pendentes = {}
     ok = falhou = 0
 
     for _ in range(2):                      # 2 níveis: CSS → fontes que ele usa
@@ -133,15 +171,26 @@ def completar_externos(html, assets, out):
                     open(os.path.join(assets, b2), "wb").write(d2)
                     txt = txt.replace(m.group(1), b2)
                 open(os.path.join(assets, base), "w", encoding="utf-8").write(txt)
+            # Só as formas absolutas: aqui a URL sempre aparece completa no
+            # HTML, e a variante curta ("/default") casaria dentro de um
+            # caminho já resolvido, gerando "assets/xassets/y".
             tok = "\x00EXT%d\x00" % ok
-            for v in variantes(url):
-                if v in html:
-                    html = html.replace(v, tok)
-            html = html.replace(tok, "assets/" + base)
+            sp_u = urlsplit(url)
+            q_u = ("?" + sp_u.query) if sp_u.query else ""
+            for v in (url,
+                      sp_u.scheme + "://" + sp_u.netloc + sp_u.path + q_u,
+                      sp_u.scheme + "://" + sp_u.netloc + sp_u.path,
+                      "//" + sp_u.netloc + sp_u.path + q_u,
+                      "//" + sp_u.netloc + sp_u.path):
+                html, _k = trocar(html, v, tok)
+            pendentes[tok] = "assets/" + base
             ok += 1
             novos = True
         if not novos:
             break
+
+    for tok, local in pendentes.items():
+        html = html.replace(tok, local)
 
     # CSS locais podem apontar para fora (@import de fontes, por exemplo).
     # Sem isto o clone continua dependendo do Google Fonts para renderizar.
@@ -180,29 +229,25 @@ def completar_externos(html, assets, out):
     return html
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Reconstrói um clone a partir da captura JSON")
-    ap.add_argument("json", help="arquivo gerado por capturar.js")
-    ap.add_argument("nome", nargs="?", help="nome da pasta do clone (padrão: host da página)")
-    ap.add_argument("--manter-trackers", action="store_true",
-                    help="não neutraliza os scripts de rastreamento")
-    ap.add_argument("--offline", action="store_true",
-                    help="não tenta baixar do terminal os assets externos que sobraram")
-    ap.add_argument("--bloquear", default="",
-                    help="trechos de URL extras a neutralizar, separados por vírgula "
-                         "(para analytics em domínio próprio)")
-    a = ap.parse_args()
+def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear=""):
+    """Monta o clone local a partir de um dicionário de captura.
 
-    if a.bloquear:
-        TRACKER_SRC.extend(x.strip() for x in a.bloquear.split(",") if x.strip())
+    Mesmo formato produzido por capturar.js (navegador) e por
+    clonar-direto.py (terminal): assim os dois caminhos compartilham toda a
+    limpeza, a reescrita de caminhos e a auditoria.
+    """
+    class _Args:
+        pass
+    a = _Args()
+    a.offline, a.manter_trackers = offline, manter_trackers
 
-    if not os.path.exists(a.json):
-        sys.exit("ERRO: %s não encontrado" % a.json)
-    d = json.load(open(a.json))
+    if bloquear:
+        TRACKER_SRC.extend(x.strip() for x in bloquear.split(",") if x.strip())
+
     page_url, files = d["pageUrl"], d["files"]
     html = d["html"]
 
-    nome = a.nome or re.sub(r"[^a-z0-9]+", "-", urlsplit(page_url).hostname.lower()).strip("-")
+    nome = nome or re.sub(r"[^a-z0-9]+", "-", urlsplit(page_url).hostname.lower()).strip("-")
     out = os.path.join(RAIZ, "clones", nome)
     assets = os.path.join(out, "assets")
     os.makedirs(assets, exist_ok=True)
@@ -237,8 +282,9 @@ def main():
         tok = "\x00CLONE%d\x00" % idx
         achou = False
         for v in variantes(url):
-            if v in html:
-                html = html.replace(v, tok); n += 1; achou = True
+            html, k = trocar(html, v, tok)
+            if k:
+                n += k; achou = True
         if achou:
             tokens[tok] = local
     for tok, local in tokens.items():
@@ -328,8 +374,32 @@ def main():
         r'src="(?!https?:|//|data:|chrome-extension)([^"]+)"', vivo))
     assets_ref |= set(m.group(1) for m in re.finditer(
         r'<link[^>]+href="(?!https?:|//|data:)([^"]+)"', vivo))
+    # refs dentro dos CSS também contam: é onde vivem ícones e backgrounds
+    css_ref = {}
+    for fn in os.listdir(assets):
+        if not fn.endswith(".css"):
+            continue
+        c = io.open(os.path.join(assets, fn), encoding="utf-8", errors="replace").read()
+        for m in re.finditer(r"url\(\s*['\"]?(?!data:)([^'\")]+)", c):
+            u = m.group(1).strip()
+            if u.startswith(("http://", "https://", "//")):
+                continue
+            alvo = os.path.join(assets, unquote(u.split("?")[0].split("#")[0]))
+            if not os.path.exists(alvo):
+                css_ref.setdefault(os.path.basename(u.split("?")[0].split("#")[0]), fn)
+
     faltando = sorted(r for r in assets_ref if not os.path.exists(
         os.path.join(out, unquote(r.split("?")[0]))))
+
+    # o que já dava 404 no site de origem não é buraco nosso — o log da
+    # captura registra isso, então dá para separar as duas coisas.
+    log404 = set()
+    for l in d.get("log", []):
+        if l.startswith("HTTP404") or l.startswith("HTTP403"):
+            log404.add(os.path.basename(l.split("?")[0].split("#")[0]))
+
+    css_nossos = {k: v for k, v in css_ref.items() if k not in log404}
+    css_origem = len(css_ref) - len(css_nossos)
 
     # links de navegação: só disparam se alguém clicar
     links_ext = sorted(set(m.group(1) for m in re.finditer(
@@ -344,9 +414,16 @@ def main():
     auto_ext.discard("www.w3.org")
 
     print("\n=== AUDITORIA ===")
-    print("assets referenciados: %d | faltando: %d" % (len(assets_ref), len(faltando)))
+    print("assets referenciados no HTML: %d | faltando: %d" % (len(assets_ref), len(faltando)))
     for f in faltando:
-        print("   FALTA:", f)
+        marca = "  (já dava 404 na origem)" if os.path.basename(
+            f.split("?")[0]) in log404 else ""
+        print("   FALTA:", f, marca)
+    if css_ref:
+        print("refs quebradas dentro dos CSS: %d  (%d já davam 404 na origem)"
+              % (len(css_ref), css_origem))
+        for k, v in sorted(css_nossos.items())[:12]:
+            print("   FALTA: %s  (citado em %s)" % (k, v))
     if auto_ext:
         print("\n!! %d domínio(s) que a página ainda chama SOZINHA ao abrir:"
               % len(auto_ext))
@@ -366,6 +443,25 @@ def main():
     tot = sum(os.path.getsize(os.path.join(assets, f)) for f in os.listdir(assets))
     print("\ntamanho: %.1f MB em %d arquivos" % (tot / 1048576, len(os.listdir(assets))))
     print("\nservir com:  ./servir.py %s" % nome)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Reconstrói um clone a partir da captura JSON")
+    ap.add_argument("json", help="arquivo gerado por capturar.js")
+    ap.add_argument("nome", nargs="?", help="nome da pasta do clone (padrão: host da página)")
+    ap.add_argument("--manter-trackers", action="store_true",
+                    help="não neutraliza os scripts de rastreamento")
+    ap.add_argument("--offline", action="store_true",
+                    help="não tenta baixar do terminal os assets externos que sobraram")
+    ap.add_argument("--bloquear", default="",
+                    help="trechos de URL extras a neutralizar, separados por vírgula "
+                         "(para analytics em domínio próprio)")
+    a = ap.parse_args()
+    if not os.path.exists(a.json):
+        sys.exit("ERRO: %s não encontrado" % a.json)
+    reconstruir(json.load(open(a.json)), a.nome,
+                offline=a.offline, manter_trackers=a.manter_trackers,
+                bloquear=a.bloquear)
 
 
 if __name__ == "__main__":
