@@ -24,6 +24,12 @@ Com VPN ligada, se o site exigir. Deixe a aba carregar por completo.
 
 `F12` → aba **Console** → cole o conteúdo de [`capturar.js`](capturar.js) → Enter.
 
+Para pegar o script sem abrir editor:
+
+```bash
+./copiar.sh     # copia pro clipboard, ou abre no navegador se não houver ferramenta
+```
+
 Acompanhe o progresso. No fim aparece:
 
 ```

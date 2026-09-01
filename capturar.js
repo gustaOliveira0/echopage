@@ -49,7 +49,9 @@
         [...t.matchAll(/url\(\s*['"]?(?!data:)([^'")]+)/g)].forEach(m => {
           try { urls.add(new URL(m[1], cu).href); } catch {}
         });
-        [...t.matchAll(/@import\s+(?:url\()?['"]?([^'")\s;]+)/g)].forEach(m => {
+        // url() acima já cobre "@import url(...)". Aqui só a forma sem url(),
+        // e o padrão NÃO pode parar no ";" — a query do Google Fonts tem ";".
+        [...t.matchAll(/@import\s+['"]([^'"]+)['"]/g)].forEach(m => {
           try { urls.add(new URL(m[1], cu).href); } catch {}
         });
       } catch { console.warn('css inacessível:', cu); }
