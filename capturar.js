@@ -23,17 +23,34 @@
     '/collect', '/g/collect', '/tr\\?', 'pixel', '_tracking'
   ].join('|'), 'i');
 
+  // ── 0. rola a página inteira para disparar lazy-load ─────────
+  // muita imagem/vídeo só é baixado quando entra na tela; sem isto eles
+  // nunca aparecem na captura.
+  console.log('%c rolando a página para carregar tudo… ', 'background:#222;color:#0ff');
+  await (async () => {
+    const altura = () => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+    const passo = Math.max(300, innerHeight * 0.85);
+    for (let y = 0; y < altura(); y += passo) {
+      scrollTo(0, y);
+      await new Promise(r => setTimeout(r, 180));
+    }
+    scrollTo(0, altura());
+    await new Promise(r => setTimeout(r, 700));   // deixa o lazy-load do rodapé terminar
+    scrollTo(0, 0);
+    await new Promise(r => setTimeout(r, 250));
+  })();
+
   // ── 1. tudo que o navegador já carregou ──────────────────────
   performance.getEntriesByType('resource').forEach(e => add(e.name));
 
-  // ── 2. varredura do DOM (pega <video> que o performance perde) ─
-  document.querySelectorAll('img,script,video,audio,source,track,embed,object,link[href]').forEach(el => {
-    add(el.getAttribute('src') || el.getAttribute('data-src') ||
-        el.getAttribute('data-lazy-src') || el.getAttribute('href') || el.getAttribute('data'));
-    [el.getAttribute('srcset'), el.getAttribute('data-srcset')].forEach(ss =>
+  // ── 2. varredura do DOM (pega <video> e atributos que o performance perde) ─
+  document.querySelectorAll('*').forEach(el => {
+    ['src', 'data-src', 'data-lazy-src', 'data-original', 'data-bg', 'data-background',
+     'data-image', 'data-poster', 'poster', 'href', 'data'].forEach(at => add(el.getAttribute && el.getAttribute(at)));
+    [el.getAttribute && el.getAttribute('srcset'), el.getAttribute && el.getAttribute('data-srcset')].forEach(ss =>
       (ss || '').split(',').forEach(s => add(s.trim().split(/\s+/)[0])));
   });
-  document.querySelectorAll('video,audio').forEach(v => { add(v.src); add(v.currentSrc); });
+  document.querySelectorAll('video,audio').forEach(v => { add(v.src); add(v.currentSrc); add(v.poster); });
   document.querySelectorAll('[style*="url("]').forEach(el =>
     [...el.getAttribute('style').matchAll(/url\(['"]?([^'")]+)/g)].forEach(m => add(m[1])));
 

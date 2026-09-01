@@ -67,6 +67,8 @@ TRACKER_INLINE = [
     "dataLayer", "gtag(", "posthog.init", "__CF$cv", "_conv_q", "window.convert",
     "GTM-", "clarity", "fbq(", "ttq.", "_hjSettings", "analytics.load",
     "mixpanel.init", "amplitude.getInstance", "Sentry.init", "newrelic",
+    # tracking de rede de afiliado inline (Everflow, mxj5trk e afins)
+    "mxj5trk", "EF.click", "EF.conversion", "EF.urlParameter", "everflow",
 ]
 
 # O JavaScript do site chama fbq(), gtag(), posthog.capture()... Se a gente
@@ -178,13 +180,23 @@ def variantes(url):
     sp = urlsplit(url)
     q = ("?" + sp.query) if sp.query else ""
     vistos, saida = set(), []
+    rel = sp.path.lstrip("/")               # forma relativa sem barra inicial
     for v in (url,
               sp.scheme + "://" + sp.netloc + sp.path + q,
               sp.scheme + "://" + sp.netloc + sp.path,
               "//" + sp.netloc + sp.path + q,
               "//" + sp.netloc + sp.path,
               sp.path + q,
-              sp.path):
+              sp.path,
+              # caminhos relativos (o HTML usa "assets/ja/css/x.css",
+              # "./assets/ja/images/y.png", "../common/css/z.css" — sem
+              # domínio nem barra inicial, às vezes subindo de nível)
+              rel + q,
+              rel,
+              "./" + rel + q,
+              "./" + rel,
+              "../" + rel,
+              "../../" + rel):
         if v and v not in vistos and len(v) > 1:
             vistos.add(v); saida.append(v)
             esc = v.replace("&", "&amp;")
@@ -558,6 +570,21 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
 
         html, n_link = re.subn(r"<a\b[^>]*>", troca_a, html)
         print("LINK nos <a>: %d -> %s" % (n_link, link))
+
+        # Nessas landers o CTA de compra costuma ser <button onclick="nextPage()">,
+        # não <a>. Sobrescreve as funções de checkout para o mesmo link, senão o
+        # botão principal continua indo para o checkout de origem.
+        js_link = link.replace("\\", "\\\\").replace('"', '\\"')
+        funcs = [f for f in ("nextPage", "goToCheckout", "goToOrder", "redirectToCheckout",
+                             "toCheckout", "gotoCheckout")
+                 if re.search(r"\b" + f + r"\s*\(", html)]
+        if funcs:
+            ov = ('<script data-clone="link">'
+                  + "".join('window.%s=function(){location.href="%s"};' % (f, js_link) for f in funcs)
+                  + "</script>")
+            html = (html.replace("</body>", ov + "</body>", 1)
+                    if "</body>" in html else html + ov)
+            print("  funções de checkout -> link: %s" % ", ".join(funcs))
 
     if redirect:
         # depois da limpeza: entra no fim do <body> para rodar por último
