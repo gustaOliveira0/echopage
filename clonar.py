@@ -449,11 +449,27 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             tokens[tok] = local
     for tok, local in tokens.items():
         html = html.replace(tok, local)
+
+    # cache-buster: o HTML costuma referenciar "x.png?t=123456" enquanto o
+    # asset foi capturado/gravado sem essa query. Casa o caminho seguido de
+    # qualquer "?..." e troca pelo arquivo local.
+    n_cb = 0
+    for url, local in sorted(url2local.items(), key=lambda kv: -len(kv[0])):
+        sp2 = urlsplit(url)
+        rel2 = sp2.path.lstrip("/")
+        for base in dict.fromkeys([sp2.path, rel2, "./" + rel2, "../" + rel2]):
+            if len(base) < 2:
+                continue
+            pat = r'(?<=["\'(,\s])' + re.escape(base) + r'\?[^"\')\s,]*'
+            html, k = re.subn(pat, local.replace("\\", "\\\\"), html)
+            n_cb += k
+    n += n_cb
+
     # âncoras que apontam para a própria página
     base_page = page_url.split("#")[0]
     html, k = re.subn(re.escape(base_page) + r"#", "#", html)
     n += k
-    print("URLs reescritas no HTML: %d" % n)
+    print("URLs reescritas no HTML: %d%s" % (n, " (%d com cache-buster)" % n_cb if n_cb else ""))
 
     # ── 3. neutraliza rastreadores ────────────────────────────────
     # Um script de tracker já teve o src reescrito para assets/xxx.js, então
