@@ -136,6 +136,53 @@ def redirect_snippet(dest):
             '})();\n</script>')
 
 
+def link_snippet(dest):
+    """Manda TODA navegação para o destino, sem quebrar a UI.
+
+    - sobrescreve funções de troca de página (nextPage, goToCheckout...);
+    - intercepta cliques em <a>/<button>/onclick que levam a outra página;
+    - intercepta o submit de formulários.
+    O que permanece na página — âncoras internas (#) e elementos de FAQ,
+    slider, menu — não é redirecionado.
+    """
+    d = dest.replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        '<script data-clone="link">\n'
+        '(function(){var DEST="' + d + '";\n'
+        'var UI=/faq|accordion|collaps|toggle|question|answer|swiper|splide|'
+        'slider|carousel|\\btabs?\\b|dropdown|hamburger|menu|modal|popup|'
+        'lightbox|tooltip|counter|countdown|timer/i;\n'
+        'function cls(el){if(!el||el.className==null)return "";'
+        'var c=el.className;return (c.baseVal!==undefined?c.baseVal:c)+"";}\n'
+        'function ui(el){while(el&&el!==document.documentElement){'
+        'if(UI.test(cls(el)))return true;if(el.getAttribute){'
+        'if(UI.test(el.getAttribute("id")||""))return true;'
+        'var r=el.getAttribute("role")||"";if(/tab|menuitem|switch/.test(r))return true;}'
+        'el=el.parentElement;}return false;}\n'
+        'function interno(h){return !h||h.charAt(0)==="#"||h.indexOf("javascript:")===0;}\n'
+        '["nextPage","goToCheckout","goToOrder","redirectToCheckout","toCheckout",'
+        '"gotoCheckout"].forEach(function(f){try{window[f]=function(){location.href=DEST;};}catch(_){}});\n'
+        'function fix(){var as=document.querySelectorAll("a[href]");'
+        'for(var i=0;i<as.length;i++){var a=as[i];var h=a.getAttribute("href");'
+        'if(interno(h)||ui(a))continue;a.setAttribute("href",DEST);'
+        'a.removeAttribute("target");a.removeAttribute("onclick");}}\n'
+        'fix();document.addEventListener("DOMContentLoaded",fix);\n'
+        'function nav(el){while(el&&el!==document.documentElement){'
+        'var t=el.tagName?el.tagName.toLowerCase():"";'
+        'if(t==="a"){return interno(el.getAttribute("href"))?null:el;}'
+        'if(t==="button"){if((el.getAttribute("type")||"").toLowerCase()!=="reset")return el;}'
+        'if(t==="input"){var y=(el.type||"").toLowerCase();'
+        'if(y==="submit"||y==="button"||y==="image")return el;}'
+        'if(el.getAttribute&&el.hasAttribute("onclick"))return el;'
+        'el=el.parentElement;}return null;}\n'
+        'document.addEventListener("click",function(e){'
+        'if(ui(e.target))return;if(nav(e.target)){e.preventDefault();e.stopPropagation();'
+        'if(e.stopImmediatePropagation)e.stopImmediatePropagation();location.href=DEST;}},true);\n'
+        'document.addEventListener("submit",function(e){'
+        'if(ui(e.target))return;e.preventDefault();location.href=DEST;},true);\n'
+        '})();\n</script>')
+
+
 MIME_EXT = {
     "text/css": ".css", "application/javascript": ".js", "text/javascript": ".js",
     "image/webp": ".webp", "image/png": ".png", "image/jpeg": ".jpg",
@@ -569,14 +616,20 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             print("LIMPEZA: %s" % ", ".join("%s=%d" % (k, v) for k, v in c.items() if v))
 
     if link:
-        # Escopo simples (o padrão): troca o href de cada <a> pela URL, e tira
-        # onclick/target para que o hover mostre a URL e o clique vá até ela.
-        # Não mexe em nada além dos <a>.
+        # Padrão: TODA navegação (troca de página, link externo, botão de
+        # checkout, submit de formulário) vai para o link fornecido. O que
+        # permanece na página — âncoras internas (#) e interações de UI
+        # (FAQ, slider, menu) — não é tocado.
         alvo = link.replace("\\", "\\\\").replace('"', "&quot;")
 
+        # (1) Reescrita estática do href dos <a> que trocam de página / são
+        #     externos (mantém âncoras internas), para o hover mostrar o link.
         def troca_a(m):
             tag = m.group(0)
-            if 'href="' in tag:
+            h = re.search(r'href="([^"]*)"', tag)
+            if h and (h.group(1).startswith("#") or h.group(1).startswith("javascript:")):
+                return tag                       # âncora interna / js: preserva
+            if h:
                 tag = re.sub(r'href="[^"]*"', 'href="%s"' % alvo, tag, count=1)
             else:
                 tag = tag[:2] + ' href="%s"' % alvo + tag[2:]
@@ -587,20 +640,10 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         html, n_link = re.subn(r"<a\b[^>]*>", troca_a, html)
         print("LINK nos <a>: %d -> %s" % (n_link, link))
 
-        # Nessas landers o CTA de compra costuma ser <button onclick="nextPage()">,
-        # não <a>. Sobrescreve as funções de checkout para o mesmo link, senão o
-        # botão principal continua indo para o checkout de origem.
-        js_link = link.replace("\\", "\\\\").replace('"', '\\"')
-        funcs = [f for f in ("nextPage", "goToCheckout", "goToOrder", "redirectToCheckout",
-                             "toCheckout", "gotoCheckout")
-                 if re.search(r"\b" + f + r"\s*\(", html)]
-        if funcs:
-            ov = ('<script data-clone="link">'
-                  + "".join('window.%s=function(){location.href="%s"};' % (f, js_link) for f in funcs)
-                  + "</script>")
-            html = (html.replace("</body>", ov + "</body>", 1)
-                    if "</body>" in html else html + ov)
-            print("  funções de checkout -> link: %s" % ", ".join(funcs))
+        # (2) Snippet: sobrescreve funções de troca de página, intercepta
+        #     cliques que levam a outra página e o submit de formulários.
+        html = html.replace("</body>", link_snippet(link) + "\n</body>", 1) \
+            if "</body>" in html else html + link_snippet(link)
 
     if redirect:
         # depois da limpeza: entra no fim do <body> para rodar por último

@@ -23,9 +23,12 @@ links `<a>` para uma URL fornecida.
    Atenção: o `src` do tracker pode ter sido reescrito para `assets/xxx.js`,
    escondendo o domínio; a decisão olha a **URL de origem**, não o nome local.
 
-3. **Trocar o link dos `<a>`** pela URL que o usuário fornecer — apenas os
-   elementos `<a>`. O `href` visível (hover) e o clique passam a apontar para
-   essa URL. Não mexer em botões que não sejam `<a>`, nem em mais nada.
+3. **Mandar toda navegação para a URL fornecida** (`--link`). Qualquer coisa
+   que levaria o visitante a **outra página** — link externo, `<a>` para outra
+   página, botão de troca de página (`<button onclick="nextPage()">` e afins),
+   submit de formulário — passa a apontar para a URL dada; o `href` visível
+   (hover) também. O que **permanece na página** não é tocado: âncoras internas
+   (`#`) e interações de UI (FAQ, slider, menu, cronômetro).
 
 ## Ferramentas (em `~/clonador-paginas`)
 
