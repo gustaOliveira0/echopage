@@ -323,6 +323,19 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="")
             r'<iframe\1data-clone-disabled="tracker-iframe"\2>', html)
         html, n_ns = re.subn(r"<noscript><iframe[^>]*(?:googletagmanager|facebook)[^>]*>.*?</noscript>",
                              "<!-- tracker noscript removido -->", html, flags=re.S)
+
+        # pixels são <img>/<iframe>, não <script>: bloquear só o download
+        # deixaria a tag apontando para o rastreador e ela dispararia igual.
+        def mata_pixel(m):
+            tag, attrs = m.group(1), m.group(2)
+            src = re.search(r'src="([^"]*)"', attrs)
+            if not src or not eh_tracker(src.group(1)):
+                return m.group(0)
+            limpo = re.sub(r'\ssrc="[^"]*"', "", attrs)
+            return '<%s%s data-clone-disabled="pixel">' % (tag, limpo)
+
+        html, n_px = re.subn(r"<(img|iframe)([^>]*)>", mata_pixel, html)
+        print("pixels neutralizados: %d" % n_px) if n_px else None
         print("scripts neutralizados: %d | iframes: %d | noscript: %d"
               % (len(mortos), n_ifr, n_ns))
 
@@ -384,9 +397,11 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="")
             u = m.group(1).strip()
             if u.startswith(("http://", "https://", "//")):
                 continue
-            alvo = os.path.join(assets, unquote(u.split("?")[0].split("#")[0]))
-            if not os.path.exists(alvo):
-                css_ref.setdefault(os.path.basename(u.split("?")[0].split("#")[0]), fn)
+            limpo = unquote(u.split("?")[0].split("#")[0])
+            base_u = os.path.basename(limpo)
+            if not os.path.exists(os.path.join(assets, limpo)) and \
+               not os.path.exists(os.path.join(assets, base_u)):
+                css_ref.setdefault(base_u, fn)
 
     faltando = sorted(r for r in assets_ref if not os.path.exists(
         os.path.join(out, unquote(r.split("?")[0]))))
