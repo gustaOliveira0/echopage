@@ -56,6 +56,12 @@ TRACKER_SRC = [
     "/static/recorder", "/i/v0/e/", "/e/?ip=", "gtm.js", "gtag/js",
     "convert_tracking", "checktrafficnew", "/ajax.php/extensions",
     "facebook.com/tr", "/pagead/viewthroughconversion", "/signals/config",
+    # redes de tracking de afiliado/CPA e verificação de tráfego (cloaking)
+    "mxj5trk", "trackjs", "/track.js", "voluum", "redtrack", "binom",
+    "clickmagick", "everflow", "cloaker",
+    # PostHog atrás de proxy próprio: a chave de projeto começa sempre por
+    # "phc_" e o SDK carrega de /array/<chave>/ — pega o config.js disfarçado.
+    "phc_", "/array/phc",
 ]
 TRACKER_INLINE = [
     "dataLayer", "gtag(", "posthog.init", "__CF$cv", "_conv_q", "window.convert",
@@ -85,6 +91,48 @@ window.snaptr=window.snaptr||function(){};
 window.obApi=window.obApi||function(){};
 window.Sentry=window.Sentry||{init:function(){},captureException:function(){}};
 </script>"""
+
+
+def redirect_snippet(dest):
+    """Manda os CTAs e links para o destino, SEM quebrar a UI da página.
+
+    Redireciona cliques em link/botão (e elementos com cursor:pointer, que
+    são os CTAs em <div> dessas landers), mas ignora quem estiver dentro de
+    um FAQ, accordion, slider, tab ou menu — assim o FAQ continua abrindo e
+    o cronômetro/carrossel seguem rodando com o JS original do site. Roda na
+    fase de captura para decidir antes dos handlers do próprio site.
+    """
+    d = dest.replace("\\", "\\\\").replace('"', '\\"')
+    return ('<script data-clone="redirect">\n'
+            '(function(){var DEST="' + d + '";\n'
+            # classes/ids de UI interativa que NÃO devem virar redirect
+            'var UI=/faq|accordion|collaps|toggle|question|answer|swiper|splide|'
+            'slider|carousel|\\btabs?\\b|dropdown|hamburger|menu|modal|popup|'
+            'lightbox|tooltip|counter|countdown|timer/i;\n'
+            'function cls(el){if(!el||el.className==null)return "";'
+            'var c=el.className;return (c.baseVal!==undefined?c.baseVal:c)+"";}\n'
+            'function ui(el){while(el&&el!==document.documentElement){'
+            'if(UI.test(cls(el)))return true;'
+            'if(el.getAttribute){if(UI.test(el.getAttribute("id")||""))return true;'
+            'var r=el.getAttribute("role")||"";if(/tab|menuitem|switch/.test(r))return true;}'
+            'el=el.parentElement;}return false;}\n'
+            'function clic(el){while(el&&el!==document.documentElement){'
+            'var t=el.tagName?el.tagName.toLowerCase():"";'
+            'if(t==="a"||t==="button")return true;'
+            'if(t==="input"){var y=(el.type||"").toLowerCase();'
+            'if(y==="submit"||y==="button"||y==="image")return true;}'
+            'if(el.getAttribute&&(el.getAttribute("role")==="button"||el.hasAttribute("onclick")))return true;'
+            'try{if(getComputedStyle(el).cursor==="pointer")return true;}catch(_){}'
+            'el=el.parentElement;}return false;}\n'
+            'function go(e){e.preventDefault();e.stopPropagation();'
+            'if(e.stopImmediatePropagation)e.stopImmediatePropagation();'
+            'window.location.href=DEST;return false;}\n'
+            'document.addEventListener("click",function(e){'
+            'if(ui(e.target))return;if(clic(e.target))go(e);},true);\n'
+            'document.addEventListener("submit",function(e){'
+            'if(!ui(e.target))go(e);},true);\n'
+            '})();\n</script>')
+
 
 MIME_EXT = {
     "text/css": ".css", "application/javascript": ".js", "text/javascript": ".js",
@@ -327,7 +375,7 @@ def podar_css(assets):
 
 
 def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
-                marcar=False):
+                marcar=False, redirect="", so_frontend=False, link=""):
     """Monta o clone local a partir de um dicionário de captura.
 
     Mesmo formato produzido por capturar.js (navegador) e por
@@ -338,6 +386,8 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         pass
     a = _Args()
     a.offline, a.manter_trackers, a.marcar = offline, manter_trackers, marcar
+    a.so_frontend = so_frontend
+    a.link = link
 
     if bloquear:
         TRACKER_SRC.extend(x.strip() for x in bloquear.split(",") if x.strip())
@@ -394,6 +444,10 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
     print("URLs reescritas no HTML: %d" % n)
 
     # ── 3. neutraliza rastreadores ────────────────────────────────
+    # Um script de tracker já teve o src reescrito para assets/xxx.js, então
+    # "mxj5trk" some do src. Este mapa recupera a URL de origem para a
+    # marcação decidir pelo domínio real, não pelo nome local.
+    local2url = {v.split("?")[0]: k for k, v in url2local.items()}
     mortos = []
     if not a.manter_trackers:
         def mata(m):
@@ -403,8 +457,10 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             src = re.search(r'src="([^"]*)"', attrs)
             porque = None
             if src:
+                alvo = src.group(1)
+                origem = local2url.get(alvo.split("?")[0], "")
                 for t in TRACKER_SRC:
-                    if t in src.group(1): porque = t; break
+                    if t in alvo or (origem and t in origem): porque = t; break
             else:
                 for t in TRACKER_INLINE:
                     if t in corpo: porque = t; break
@@ -469,8 +525,48 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             # atributos que guardam URL de destino do funil
             html, c["dataurl"] = re.subn(
                 r'\s(?:data-go-to|data-href|data-url|data-redirect)="https?://[^"]*"', "", html)
-            html = re.sub(r"(<head\b[^>]*>)", lambda m: m.group(1) + STUBS, html, count=1)
+
+            if a.so_frontend:
+                # Só o frontend: remove TODO o JavaScript restante (UI,
+                # anti-bot, verificação de tráfego, cloaking). Sobram só
+                # HTML/CSS/imagens/fontes — e o redirect, injetado depois.
+                # Sem scripts do site, os stubs também são dispensáveis.
+                html, c["js"] = re.subn(
+                    r"<script\b(?![^>]*data-clone)[^>]*>.*?</script>\s*", "", html, flags=re.S)
+                html, c["jssrc"] = re.subn(
+                    r"<script\b(?![^>]*data-clone)[^>]*/?>\s*", "", html)
+                html, c["onattr"] = re.subn(r'\son\w+="[^"]*"', "", html)
+            else:
+                html = re.sub(r"(<head\b[^>]*>)", lambda m: m.group(1) + STUBS, html, count=1)
             print("LIMPEZA: %s" % ", ".join("%s=%d" % (k, v) for k, v in c.items() if v))
+
+    if link:
+        # Escopo simples (o padrão): troca o href de cada <a> pela URL, e tira
+        # onclick/target para que o hover mostre a URL e o clique vá até ela.
+        # Não mexe em nada além dos <a>.
+        alvo = link.replace("\\", "\\\\").replace('"', "&quot;")
+
+        def troca_a(m):
+            tag = m.group(0)
+            if 'href="' in tag:
+                tag = re.sub(r'href="[^"]*"', 'href="%s"' % alvo, tag, count=1)
+            else:
+                tag = tag[:2] + ' href="%s"' % alvo + tag[2:]
+            tag = re.sub(r'\son\w+="[^"]*"', "", tag)
+            tag = re.sub(r'\starget="[^"]*"', "", tag)
+            return tag
+
+        html, n_link = re.subn(r"<a\b[^>]*>", troca_a, html)
+        print("LINK nos <a>: %d -> %s" % (n_link, link))
+
+    if redirect:
+        # depois da limpeza: entra no fim do <body> para rodar por último
+        snip = redirect_snippet(redirect)
+        if "</body>" in html:
+            html = html.replace("</body>", snip + "\n</body>", 1)
+        else:
+            html += snip
+        print("REDIRECT: todo clique -> %s" % redirect)
     io.open(os.path.join(out, "index.html"), "w",
             encoding="utf-8", errors="surrogatepass").write(html)
 
@@ -604,6 +700,13 @@ def main():
                     help="não mexe nos scripts de rastreamento")
     ap.add_argument("--marcar", action="store_true",
                     help="só marca os rastreadores (type=text/plain) em vez de removê-los")
+    ap.add_argument("--link", default="", metavar="URL",
+                    help="troca o href de todos os <a> por esta URL (só os <a>)")
+    ap.add_argument("--redirect", default="", metavar="URL",
+                    help="(avançado) intercepta todo clique de CTA e leva a esta URL")
+    ap.add_argument("--so-frontend", action="store_true",
+                    help="remove TODO o JavaScript (UI, anti-bot, verificação "
+                         "de tráfego), deixando só HTML/CSS/imagens + o redirect")
     ap.add_argument("--offline", action="store_true",
                     help="não tenta baixar do terminal os assets externos que sobraram")
     ap.add_argument("--bloquear", default="",
@@ -614,7 +717,8 @@ def main():
         sys.exit("ERRO: %s não encontrado" % a.json)
     reconstruir(json.load(open(a.json)), a.nome,
                 offline=a.offline, manter_trackers=a.manter_trackers,
-                bloquear=a.bloquear, marcar=a.marcar)
+                bloquear=a.bloquear, marcar=a.marcar, redirect=a.redirect,
+                so_frontend=a.so_frontend, link=a.link)
 
 
 if __name__ == "__main__":
