@@ -63,6 +63,29 @@ TRACKER_INLINE = [
     "mixpanel.init", "amplitude.getInstance", "Sentry.init", "newrelic",
 ]
 
+# O JavaScript do site chama fbq(), gtag(), posthog.capture()... Se a gente
+# apenas remove os rastreadores, essas chamadas viram ReferenceError e podem
+# derrubar o resto da página. Os stubs absorvem as chamadas sem fazer nada.
+STUBS = """<script data-clone="stubs">
+window.dataLayer=window.dataLayer||[];
+window.gtag=window.gtag||function(){};
+window.ga=window.ga||function(){};
+window.fbq=window.fbq||function(){};window._fbq=window.fbq;
+window.ttq=window.ttq||{track:function(){},page:function(){},load:function(){},identify:function(){}};
+window.clarity=window.clarity||function(){};
+window.posthog=window.posthog||{init:function(){},capture:function(){},register:function(){},identify:function(){},onFeatureFlags:function(){},people:{set:function(){}}};
+window.analytics=window.analytics||{track:function(){},page:function(){},identify:function(){},load:function(){},ready:function(){}};
+window.mixpanel=window.mixpanel||{init:function(){},track:function(){}};
+window.amplitude=window.amplitude||{getInstance:function(){return{init:function(){},logEvent:function(){}}}};
+window.hj=window.hj||function(){};window._hjSettings=window._hjSettings||{};
+window._conv_q=window._conv_q||[];
+window.convert=window.convert||{currentData:{experiences:{}}};
+window.uetq=window.uetq||[];
+window.snaptr=window.snaptr||function(){};
+window.obApi=window.obApi||function(){};
+window.Sentry=window.Sentry||{init:function(){},captureException:function(){}};
+</script>"""
+
 MIME_EXT = {
     "text/css": ".css", "application/javascript": ".js", "text/javascript": ".js",
     "image/webp": ".webp", "image/png": ".png", "image/jpeg": ".jpg",
@@ -229,7 +252,82 @@ def completar_externos(html, assets, out):
     return html
 
 
-def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear=""):
+def podar_css(assets):
+    """Remove de @font-face/background as url() que não existem localmente.
+
+    Sem isto o navegador pede arquivos 404 a cada carregamento — barulho no
+    console e requisição desperdiçada. Só poda quando sobra alternativa
+    válida na mesma declaração: se TODAS quebraram, mantém como está, porque
+    aí o problema é da origem e apagar não conserta nada.
+    """
+    from urllib.parse import unquote
+    podadas = intactas = 0
+
+    def existe(u):
+        limpo = unquote(u.strip("'\" ").split("?")[0].split("#")[0])
+        if limpo.startswith(("http://", "https://", "//", "data:")):
+            return True
+        return (os.path.exists(os.path.join(assets, limpo)) or
+                os.path.exists(os.path.join(assets, os.path.basename(limpo))))
+
+    reparadas = [0]
+
+    def reparar(m):
+        """Se o caminho literal não resolve mas o arquivo está em assets/
+        com o mesmo nome, aponta para ele. Cobre a variante "?#iefix" e
+        caminhos relativos com profundidade errada."""
+        bruto = m.group(1).strip()
+        limpo_q = bruto.strip("'\" ")
+        if limpo_q.startswith(("http://", "https://", "//", "data:")):
+            return m.group(0)
+        alvo = unquote(limpo_q.split("?")[0].split("#")[0])
+        if os.path.exists(os.path.join(assets, alvo)):
+            return m.group(0)
+        base_a = os.path.basename(alvo)
+        if base_a and os.path.exists(os.path.join(assets, base_a)):
+            reparadas[0] += 1
+            return "url(" + base_a + ")"
+        return m.group(0)
+
+    for fn in sorted(os.listdir(assets)):
+        if not fn.endswith(".css"):
+            continue
+        cp = os.path.join(assets, fn)
+        c = io.open(cp, encoding="utf-8", errors="replace").read()
+        c = re.sub(r"url\(([^)]*)\)", reparar, c)
+
+        def fix_src(m):
+            nonlocal podadas, intactas
+            corpo = m.group(1)
+            partes = [p.strip() for p in corpo.split(",")]
+            bons = []
+            for parte in partes:
+                u = re.search(r"url\(([^)]*)\)", parte)
+                if not u or existe(u.group(1)):
+                    bons.append(parte)
+            fim = m.group(2)
+            if not bons or len(bons) == len(partes):
+                intactas += len(partes) - len(bons)
+                return m.group(0)
+            podadas += len(partes) - len(bons)
+            sep = "\n\t\t" if "\n" in corpo else " "
+            return "src:" + sep + ("," + sep).join(bons) + fim
+
+        # o terminador pode ser ";" ou o "}" do bloco — sem aceitar os dois,
+        # a última declaração de cada regra escapava da poda.
+        c = re.sub(r"src\s*:\s*([^;{}]+)([;}])", fix_src, c)
+        io.open(cp, "w", encoding="utf-8", errors="replace").write(c)
+
+    if reparadas[0]:
+        print("CSS reparado: %d refs remapeadas para o arquivo local" % reparadas[0])
+    if podadas or intactas:
+        print("CSS podado: %d refs mortas removidas" % podadas +
+              (" (%d mantidas: nenhuma alternativa válida)" % intactas if intactas else ""))
+    return podadas
+
+
+def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
+                marcar=False):
     """Monta o clone local a partir de um dicionário de captura.
 
     Mesmo formato produzido por capturar.js (navegador) e por
@@ -239,7 +337,7 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="")
     class _Args:
         pass
     a = _Args()
-    a.offline, a.manter_trackers = offline, manter_trackers
+    a.offline, a.manter_trackers, a.marcar = offline, manter_trackers, marcar
 
     if bloquear:
         TRACKER_SRC.extend(x.strip() for x in bloquear.split(",") if x.strip())
@@ -326,19 +424,53 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="")
 
         # pixels são <img>/<iframe>, não <script>: bloquear só o download
         # deixaria a tag apontando para o rastreador e ela dispararia igual.
+        px = [0]
+
         def mata_pixel(m):
             tag, attrs = m.group(1), m.group(2)
             src = re.search(r'src="([^"]*)"', attrs)
             if not src or not eh_tracker(src.group(1)):
                 return m.group(0)
             limpo = re.sub(r'\ssrc="[^"]*"', "", attrs)
+            px[0] += 1
             return '<%s%s data-clone-disabled="pixel">' % (tag, limpo)
 
-        html, n_px = re.subn(r"<(img|iframe)([^>]*)>", mata_pixel, html)
-        print("pixels neutralizados: %d" % n_px) if n_px else None
-        print("scripts neutralizados: %d | iframes: %d | noscript: %d"
-              % (len(mortos), n_ifr, n_ns))
+        html = re.sub(r"<(img|iframe)([^>]*)>", mata_pixel, html)
+        print("rastreadores encontrados: %d scripts, %d iframes, %d pixels"
+              % (len(mortos), n_ifr + n_ns, px[0]))
 
+        if not a.marcar:
+            # LIMPEZA TOTAL: tira o que foi marcado em vez de só desativar,
+            # e mais tudo que amarra a página ao servidor de origem.
+            c = {}
+            html, c["scripts"] = re.subn(
+                r"<script\b[^>]*data-clone-disabled[^>]*>.*?</script>\s*", "", html, flags=re.S)
+            html, c["pixels"] = re.subn(
+                r"<(?:img|iframe)\b[^>]*data-clone-disabled[^>]*>\s*", "", html)
+            html, c["noscript"] = re.subn(
+                r"<noscript>\s*(?:<!--[^>]*-->)?\s*</noscript>\s*", "", html)
+            # preconnect/dns-prefetch/preload para fora: só abrem conexão
+            html, c["prefetch"] = re.subn(
+                r'<link\b[^>]*rel="(?:preconnect|dns-prefetch|prefetch|preload)"[^>]*href="https?://[^"]*"[^>]*>\s*',
+                "", html)
+            html, c["prefetch2"] = re.subn(
+                r'<link\b[^>]*href="https?://[^"]*"[^>]*rel="(?:preconnect|dns-prefetch|prefetch|preload)"[^>]*>\s*',
+                "", html)
+            # CSP herdada barra arquivo local
+            html, c["csp"] = re.subn(
+                r'<meta\b[^>]*http-equiv="[Cc]ontent-[Ss]ecurity-[Pp]olicy"[^>]*>\s*', "", html)
+            # integrity/nonce conferem hash do CDN e reprovam o arquivo local
+            html, c["attrs"] = re.subn(r'\s(?:integrity|nonce)="[^"]*"', "", html)
+            html, c["cross"] = re.subn(r'\scrossorigin(?:="[^"]*")?', "", html)
+            # links externos viram inertes
+            html, c["links"] = re.subn(
+                r'(<a\b[^>]*href=")https?://[^"]*(")',
+                lambda m: m.group(1) + "#" + m.group(2), html)
+            # atributos que guardam URL de destino do funil
+            html, c["dataurl"] = re.subn(
+                r'\s(?:data-go-to|data-href|data-url|data-redirect)="https?://[^"]*"', "", html)
+            html = re.sub(r"(<head\b[^>]*>)", lambda m: m.group(1) + STUBS, html, count=1)
+            print("LIMPEZA: %s" % ", ".join("%s=%d" % (k, v) for k, v in c.items() if v))
     io.open(os.path.join(out, "index.html"), "w",
             encoding="utf-8", errors="surrogatepass").write(html)
 
@@ -378,6 +510,10 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="")
         html = completar_externos(html, assets, out)
         io.open(os.path.join(out, "index.html"), "w",
                 encoding="utf-8", errors="surrogatepass").write(html)
+
+    # ── 4c. poda referências mortas nos CSS ───────────────────────
+    if not a.marcar:
+        podar_css(assets)
 
     # ── 5. auditoria ──────────────────────────────────────────────
     vivo = re.sub(r"<script\b[^>]*data-clone-disabled.*?</script>", "", html, flags=re.S)
@@ -465,7 +601,9 @@ def main():
     ap.add_argument("json", help="arquivo gerado por capturar.js")
     ap.add_argument("nome", nargs="?", help="nome da pasta do clone (padrão: host da página)")
     ap.add_argument("--manter-trackers", action="store_true",
-                    help="não neutraliza os scripts de rastreamento")
+                    help="não mexe nos scripts de rastreamento")
+    ap.add_argument("--marcar", action="store_true",
+                    help="só marca os rastreadores (type=text/plain) em vez de removê-los")
     ap.add_argument("--offline", action="store_true",
                     help="não tenta baixar do terminal os assets externos que sobraram")
     ap.add_argument("--bloquear", default="",
@@ -476,7 +614,7 @@ def main():
         sys.exit("ERRO: %s não encontrado" % a.json)
     reconstruir(json.load(open(a.json)), a.nome,
                 offline=a.offline, manter_trackers=a.manter_trackers,
-                bloquear=a.bloquear)
+                bloquear=a.bloquear, marcar=a.marcar)
 
 
 if __name__ == "__main__":

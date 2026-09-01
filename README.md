@@ -70,6 +70,9 @@ sem internet. Para pular essa etapa: `--offline`.
 
 ### 4. Servir
 
+A limpeza descrita em [Limpeza](#limpeza--sempre-automática) já rodou —
+o clone não fala com o servidor de origem nem com nenhum rastreador.
+
 ```bash
 ./servir.py meu-clone          # abre em http://localhost:8080
 ./servir.py meu-clone 9000     # em outra porta
@@ -111,6 +114,53 @@ A auditoria lista o que não foi encontrado. Causas, em ordem de frequência:
 
 ---
 
+## Limpeza — sempre, automática
+
+Roda em toda execução de `clonar.py` e `clonar-direto.py`. Não é opção: a
+captura baixa tudo, e a reconstrução devolve **só o frontend**.
+
+**Removido do HTML** (apagado, não apenas desativado):
+
+- scripts de rastreamento — GTM, GA4, Meta Pixel, Google Ads, TikTok,
+  Clarity, Hotjar, PostHog, Segment, Mixpanel, Amplitude, Sentry, Convert.com,
+  redes de afiliados, beacons da Cloudflare
+- pixels invisíveis (`<img>`/`<iframe>` de 1×1) e blocos `<noscript>` de tracking
+- scripts injetados por extensões do navegador (`chrome-extension://`)
+- `<link rel="preconnect|dns-prefetch|preload">` apontando para fora
+- `<meta http-equiv="Content-Security-Policy">` — a CSP da origem barraria os
+  arquivos locais
+- `integrity` e `nonce` — conferem hash do CDN e reprovariam a cópia local
+- `crossorigin` — desnecessário e atrapalha em `file://`
+- `data-go-to`, `data-href`, `data-redirect` com URL do funil original
+- `href` de `<a>` para fora vira `#`
+
+**Corrigido nos CSS:**
+
+- `url()` cujo caminho literal não resolve mas cujo arquivo está em `assets/`
+  é remapeado (cobre a variante `?#iefix` e caminhos com profundidade errada)
+- entradas mortas de `@font-face` são podadas — mas só quando sobra formato
+  válido na mesma declaração. Se todos quebraram, o problema é da origem e
+  apagar não conserta nada, então fica como está e a auditoria avisa
+
+**Adicionado:**
+
+Um bloco de stubs no-op no `<head>`. O JavaScript do site chama `fbq()`,
+`gtag()`, `posthog.capture()` — sem os rastreadores essas chamadas viram
+`ReferenceError` e derrubam o resto da página. Os stubs absorvem sem fazer
+nada e sem enviar nada.
+
+Resultado esperado na auditoria: **`chamadas externas automáticas: nenhuma`**.
+
+Para inspecionar em vez de remover (depuração), use `--marcar`: os
+rastreadores viram `type="text/plain"` com `data-clone-disabled="motivo"`.
+
+```bash
+./clonar.py captura.json --marcar
+grep -o 'data-clone-disabled="[^"]*"' clones/<nome>/index.html | sort | uniq -c
+```
+
+---
+
 ## O que o clone preserva e o que ele corta
 
 **Preserva:** HTML já renderizado, CSS, JS do próprio site, imagens, vídeos,
@@ -119,13 +169,6 @@ fontes, bibliotecas (jQuery, Swiper, Splide…).
 **Corta:** Google Tag Manager, GA4, Meta Pixel, TikTok, PostHog, Microsoft
 Clarity, Hotjar, Segment, Mixpanel, Amplitude, Sentry, redes de afiliados,
 beacons da Cloudflare e scripts injetados por extensões.
-
-Nada é apagado — os scripts viram `type="text/plain"` com o atributo
-`data-clone-disabled="motivo"`. Para inspecionar o que foi cortado:
-
-```bash
-grep -o 'data-clone-disabled="[^"]*"' clones/<nome>/index.html | sort | uniq -c
-```
 
 Para reconstruir mantendo tudo ligado (**cuidado:** dispara analytics de
 verdade, com dados falsos, na conta de quem você clonou):
