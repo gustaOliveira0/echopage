@@ -141,12 +141,13 @@ def redirect_snippet(dest):
             # classes/ids de UI interativa que NÃO devem virar redirect
             'var UI=/faq|accordion|collaps|toggle|question|answer|swiper|splide|'
             'slider|carousel|\\btabs?\\b|dropdown|hamburger|menu|modal|popup|'
-            'lightbox|tooltip|counter|countdown|timer/i;\n'
+            'lightbox|tooltip|counter|countdown|timer|lang|idioma|locale|switcher/i;\n'
             'function cls(el){if(!el||el.className==null)return "";'
             'var c=el.className;return (c.baseVal!==undefined?c.baseVal:c)+"";}\n'
             'function ui(el){while(el&&el!==document.documentElement){'
             'if(UI.test(cls(el)))return true;'
-            'if(el.getAttribute){if(UI.test(el.getAttribute("id")||""))return true;'
+            'if(el.getAttribute){if(el.hasAttribute("data-clone-lang"))return true;'
+            'if(UI.test(el.getAttribute("id")||""))return true;'
             'var r=el.getAttribute("role")||"";if(/tab|menuitem|switch/.test(r))return true;}'
             'el=el.parentElement;}return false;}\n'
             'function clic(el){while(el&&el!==document.documentElement){'
@@ -167,6 +168,58 @@ def redirect_snippet(dest):
             '})();\n</script>')
 
 
+ARQ_IDIOMA = "index-%s.html"
+
+
+def marcar_idiomas(html, codigos):
+    """Põe data-clone-lang nas opções do seletor.
+
+    A marca faz três coisas: o --link deixa de sequestrar o clique, o hover
+    passa a mostrar o arquivo local, e o atalho de idioma sabe para onde ir.
+    """
+    n = [0]
+    ATRIB = r'(?:data-value|data-lang|data-language|data-locale|hreflang)'
+
+    def marca(m):
+        tag, c = m.group(0), m.group(1).strip().lower()
+        if c not in codigos or "data-clone-lang" in tag:
+            return tag
+        n[0] += 1
+        fecha = "/>" if tag.endswith("/>") else ">"
+        return tag[:-len(fecha)].rstrip() + ' data-clone-lang="%s"' % c + fecha
+
+    html = re.sub(r'<(?!/)[a-zA-Z][^>]*\b' + ATRIB + r'="([^"]*)"[^>]*>', marca, html)
+    return html, n[0]
+
+
+def idioma_snippet(mapa, atual):
+    """Troca de idioma sem servidor: cada opção leva ao arquivo local.
+
+    Roda ANTES do snippet de --link (registra o listener de captura primeiro),
+    senão o --link engoliria o clique e mandaria todo mundo para a oferta.
+    """
+    m = "{" + ",".join('"%s":"%s"' % (c, a) for c, a in sorted(mapa.items())) + "}"
+    return (
+        '<script data-clone="lang">\n'
+        '(function(){var M=' + m + ',ATUAL="' + atual + '";\n'
+        'function alvo(el){while(el&&el!==document.documentElement){'
+        'if(el.getAttribute&&el.hasAttribute("data-clone-lang"))'
+        'return M[el.getAttribute("data-clone-lang")]||"";'
+        'el=el.parentElement;}return null;}\n'
+        # o hover mostra o destino, e um <a> continua sendo um <a>
+        'function href(){var e=document.querySelectorAll("[data-clone-lang]");'
+        'for(var i=0;i<e.length;i++){var c=e[i].getAttribute("data-clone-lang");'
+        'if(M[c]&&e[i].tagName==="A")e[i].setAttribute("href",M[c]);}}\n'
+        'href();document.addEventListener("DOMContentLoaded",href);\n'
+        # marcado é sempre nosso: segura o clique mesmo sem página gerada,
+        # senão o --link mandaria quem clicou em "Deutsch" para a oferta.
+        'document.addEventListener("click",function(e){var u=alvo(e.target);'
+        'if(u===null)return;e.preventDefault();e.stopPropagation();'
+        'if(e.stopImmediatePropagation)e.stopImmediatePropagation();'
+        'if(u&&u!==M[ATUAL])location.href=u;},true);\n'
+        '})();\n</script>')
+
+
 def link_snippet(dest):
     """Manda TODA navegação para o destino, sem quebrar a UI.
 
@@ -182,11 +235,12 @@ def link_snippet(dest):
         '(function(){var DEST="' + d + '";\n'
         'var UI=/faq|accordion|collaps|toggle|question|answer|swiper|splide|'
         'slider|carousel|\\btabs?\\b|dropdown|hamburger|menu|modal|popup|'
-        'lightbox|tooltip|counter|countdown|timer/i;\n'
+        'lightbox|tooltip|counter|countdown|timer|lang|idioma|locale|switcher/i;\n'
         'function cls(el){if(!el||el.className==null)return "";'
         'var c=el.className;return (c.baseVal!==undefined?c.baseVal:c)+"";}\n'
         'function ui(el){while(el&&el!==document.documentElement){'
         'if(UI.test(cls(el)))return true;if(el.getAttribute){'
+        'if(el.hasAttribute("data-clone-lang"))return true;'
         'if(UI.test(el.getAttribute("id")||""))return true;'
         'var r=el.getAttribute("role")||"";if(/tab|menuitem|switch/.test(r))return true;}'
         'el=el.parentElement;}return false;}\n'
@@ -517,209 +571,277 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         gravados += 1
     print("assets gravados: %d  (trackers ignorados: %d)" % (gravados, ignorados))
 
-    # ── 2. reescreve o HTML ───────────────────────────────────────
-    # Substitui via token: trocar direto pelo caminho local faz a variante
-    # curta ("/x.js") casar DENTRO do que já foi trocado ("assets/x.js"),
-    # produzindo "assetsassets/x.js".
-    n, tokens = 0, {}
-    for idx, (url, local) in enumerate(sorted(url2local.items(), key=lambda kv: -len(kv[0]))):
-        tok = "\x00CLONE%d\x00" % idx
-        achou = False
-        for v in variantes(url):
-            html, k = trocar(html, v, tok)
-            if k:
-                n += k; achou = True
-        if achou:
-            tokens[tok] = local
-    for tok, local in tokens.items():
-        html = html.replace(tok, local)
+    # As duas etapas pesadas viram função para poder rodar também nas
+    # páginas de idioma (index-en.html, index-es.html…), que passam pelo
+    # mesmíssimo tratamento — sem duplicar a lógica de limpeza.
+    def diga(*x):
+        if not quieto[0]:
+            print(*x)
+    quieto = [False]
 
-    # cache-buster: o HTML costuma referenciar "x.png?t=123456" enquanto o
-    # asset foi capturado/gravado sem essa query. Casa o caminho seguido de
-    # qualquer "?..." e troca pelo arquivo local.
-    n_cb = 0
-    for url, local in sorted(url2local.items(), key=lambda kv: -len(kv[0])):
-        sp2 = urlsplit(url)
-        rel2 = sp2.path.lstrip("/")
-        for base in dict.fromkeys([sp2.path, rel2, "./" + rel2, "../" + rel2]):
-            if len(base) < 2:
-                continue
-            pat = r'(?<=["\'(,\s])' + re.escape(base) + r'\?[^"\')\s,]*'
-            html, k = re.subn(pat, local.replace("\\", "\\\\"), html)
-            n_cb += k
-    n += n_cb
+    def relocalizar(html):
+        # ── 2. reescreve o HTML ───────────────────────────────────────
+        # Substitui via token: trocar direto pelo caminho local faz a variante
+        # curta ("/x.js") casar DENTRO do que já foi trocado ("assets/x.js"),
+        # produzindo "assetsassets/x.js".
+        n, tokens = 0, {}
+        for idx, (url, local) in enumerate(sorted(url2local.items(), key=lambda kv: -len(kv[0]))):
+            tok = "\x00CLONE%d\x00" % idx
+            achou = False
+            for v in variantes(url):
+                html, k = trocar(html, v, tok)
+                if k:
+                    n += k; achou = True
+            if achou:
+                tokens[tok] = local
+        for tok, local in tokens.items():
+            html = html.replace(tok, local)
 
-    # âncoras que apontam para a própria página
-    base_page = page_url.split("#")[0]
-    html, k = re.subn(re.escape(base_page) + r"#", "#", html)
-    n += k
-    print("URLs reescritas no HTML: %d%s" % (n, " (%d com cache-buster)" % n_cb if n_cb else ""))
+        # cache-buster: o HTML costuma referenciar "x.png?t=123456" enquanto o
+        # asset foi capturado/gravado sem essa query. Casa o caminho seguido de
+        # qualquer "?..." e troca pelo arquivo local.
+        n_cb = 0
+        for url, local in sorted(url2local.items(), key=lambda kv: -len(kv[0])):
+            sp2 = urlsplit(url)
+            rel2 = sp2.path.lstrip("/")
+            for base in dict.fromkeys([sp2.path, rel2, "./" + rel2, "../" + rel2]):
+                if len(base) < 2:
+                    continue
+                pat = r'(?<=["\'(,\s])' + re.escape(base) + r'\?[^"\')\s,]*'
+                html, k = re.subn(pat, local.replace("\\", "\\\\"), html)
+                n_cb += k
+        n += n_cb
 
-    # ── 3. neutraliza rastreadores ────────────────────────────────
+        # âncoras que apontam para a própria página
+        base_page = page_url.split("#")[0]
+        html, k = re.subn(re.escape(base_page) + r"#", "#", html)
+        n += k
+        diga("URLs reescritas no HTML: %d%s" % (n, " (%d com cache-buster)" % n_cb if n_cb else ""))
+
+        return html
+
     # Um script de tracker já teve o src reescrito para assets/xxx.js, então
     # "mxj5trk" some do src. Este mapa recupera a URL de origem para a
     # marcação decidir pelo domínio real, não pelo nome local.
     local2url = {v.split("?")[0]: k for k, v in url2local.items()}
-    mortos = []
-    if not a.manter_trackers:
-        def mata(m):
-            attrs, corpo = m.group(1), m.group(2)
-            if "data-clone-disabled" in attrs:
-                return m.group(0)
-            src = re.search(r'src="([^"]*)"', attrs)
-            porque = None
-            if src:
-                alvo = src.group(1)
-                # o src pode ter virado "assets/xxx.js" e escondido o domínio:
-                # a decisão olha a URL de ORIGEM.
-                origem = local2url.get(alvo.split("?")[0], "") or alvo
-                u = (origem + " " + alvo).lower()
-                for t in TRACKER_DOMINIOS:
-                    if t in u: porque = t; break
-                if not porque and not any(k in u for k in UI_KEEP):
-                    for t in TRACKER_SRC:
+
+    def montar(html):
+        mortos = []
+        if not a.manter_trackers:
+            def mata(m):
+                attrs, corpo = m.group(1), m.group(2)
+                if "data-clone-disabled" in attrs:
+                    return m.group(0)
+                src = re.search(r'src="([^"]*)"', attrs)
+                porque = None
+                if src:
+                    alvo = src.group(1)
+                    # o src pode ter virado "assets/xxx.js" e escondido o domínio:
+                    # a decisão olha a URL de ORIGEM.
+                    origem = local2url.get(alvo.split("?")[0], "") or alvo
+                    u = (origem + " " + alvo).lower()
+                    for t in TRACKER_DOMINIOS:
                         if t in u: porque = t; break
+                    if not porque and not any(k in u for k in UI_KEEP):
+                        for t in TRACKER_SRC:
+                            if t in u: porque = t; break
+                else:
+                    for t in TRACKER_INLINE:
+                        if t in corpo: porque = t; break
+                if not porque:
+                    return m.group(0)
+                mortos.append(porque)
+                return ('<script type="text/plain" data-clone-disabled="%s"%s>%s</script>'
+                        % (porque, attrs, corpo))
+
+            html = re.sub(r"<script\b([^>]*)>(.*?)</script>", mata, html, flags=re.S)
+            html, n_ns = re.subn(r"<noscript><iframe[^>]*(?:googletagmanager|facebook)[^>]*>.*?</noscript>",
+                                 "<!-- tracker noscript removido -->", html, flags=re.S)
+
+            # pixels são <img>/<iframe>, não <script>: bloquear só o download
+            # deixaria a tag apontando para o rastreador e ela dispararia igual.
+            px = [0]
+
+            def minusculo(attrs):
+                """1x1 invisível não é interface — é beacon, venha de onde vier."""
+                def dim(nome):
+                    m = re.search(r'\b%s="(\d+)' % nome, attrs) or \
+                        re.search(r'%s\s*:\s*(\d+)\s*px' % nome, attrs)
+                    return int(m.group(1)) if m else None
+                l, a = dim("width"), dim("height")
+                return l is not None and a is not None and l <= 2 and a <= 2
+
+            def mata_pixel(m):
+                tag, attrs = m.group(1), m.group(2)
+                src = re.search(r'src="([^"]*)"', attrs)
+                # o src já virou "assets/xxx": a decisão olha a URL de ORIGEM.
+                alvo_src = src.group(1) if src else ""
+                origem = local2url.get(alvo_src.split("?")[0], alvo_src)
+                porque = None
+                if src and (eh_tracker(origem) or "saved_resource" in alvo_src):
+                    porque = "pixel"
+                elif tag == "iframe" and minusculo(attrs):
+                    porque = "iframe-1x1"          # inclusive sem src / about:blank
+                elif tag == "img" and src and minusculo(attrs) and eh_tracker(origem):
+                    porque = "pixel-1x1"
+                if not porque:
+                    return m.group(0)
+                limpo = re.sub(r'\ssrc="[^"]*"', "", attrs)
+                px[0] += 1
+                return '<%s%s data-clone-disabled="%s">' % (tag, limpo, porque)
+
+            html = re.sub(r"<(img|iframe)([^>]*)>", mata_pixel, html)
+            diga("rastreadores encontrados: %d scripts, %d noscript, %d pixels/iframes"
+                  % (len(mortos), n_ns, px[0]))
+
+            if not a.marcar:
+                # LIMPEZA TOTAL: tira o que foi marcado em vez de só desativar,
+                # e mais tudo que amarra a página ao servidor de origem.
+                c = {}
+                html, c["scripts"] = re.subn(
+                    r"<script\b[^>]*data-clone-disabled[^>]*>.*?</script>\s*", "", html, flags=re.S)
+                html, c["iframes"] = re.subn(
+                    r"<iframe\b[^>]*data-clone-disabled[^>]*>.*?</iframe>\s*", "", html, flags=re.S)
+                html, c["pixels"] = re.subn(
+                    r"<(?:img|iframe)\b[^>]*data-clone-disabled[^>]*>\s*(?:</iframe>\s*)?", "", html)
+                html, c["noscript"] = re.subn(
+                    r"<noscript>\s*(?:<!--[^>]*-->)?\s*</noscript>\s*", "", html)
+                # preconnect/dns-prefetch: só abrem conexão, nunca renderizam nada
+                html, c["hints"] = re.subn(
+                    r'<link\b[^>]*rel="(?:preconnect|dns-prefetch)"[^>]*>\s*', "", html)
+                html, c["hints2"] = re.subn(
+                    r'<link\b(?=[^>]*rel="(?:preconnect|dns-prefetch)")[^>]*>\s*', "", html)
+                # preload/prefetch que ainda apontam para fora
+                html, c["prefetch"] = re.subn(
+                    r'<link\b[^>]*rel="(?:preconnect|dns-prefetch|prefetch|preload)"[^>]*href="https?://[^"]*"[^>]*>\s*',
+                    "", html)
+                html, c["prefetch2"] = re.subn(
+                    r'<link\b[^>]*href="https?://[^"]*"[^>]*rel="(?:preconnect|dns-prefetch|prefetch|preload)"[^>]*>\s*',
+                    "", html)
+                # CSP herdada barra arquivo local
+                html, c["csp"] = re.subn(
+                    r'<meta\b[^>]*http-equiv="[Cc]ontent-[Ss]ecurity-[Pp]olicy"[^>]*>\s*', "", html)
+                # integrity/nonce conferem hash do CDN e reprovam o arquivo local
+                html, c["attrs"] = re.subn(r'\s(?:integrity|nonce)="[^"]*"', "", html)
+                html, c["cross"] = re.subn(r'\scrossorigin(?:="[^"]*")?', "", html)
+                # links externos viram inertes
+                html, c["links"] = re.subn(
+                    r'(<a\b[^>]*href=")https?://[^"]*(")',
+                    lambda m: m.group(1) + "#" + m.group(2), html)
+                # atributos que guardam URL de destino do funil
+                html, c["dataurl"] = re.subn(
+                    r'\s(?:data-go-to|data-href|data-url|data-redirect)="https?://[^"]*"', "", html)
+
+                if a.so_frontend:
+                    # Só o frontend: remove TODO o JavaScript restante (UI,
+                    # anti-bot, verificação de tráfego, cloaking). Sobram só
+                    # HTML/CSS/imagens/fontes — e o redirect, injetado depois.
+                    # Sem scripts do site, os stubs também são dispensáveis.
+                    html, c["js"] = re.subn(
+                        r"<script\b(?![^>]*data-clone)[^>]*>.*?</script>\s*", "", html, flags=re.S)
+                    html, c["jssrc"] = re.subn(
+                        r"<script\b(?![^>]*data-clone)[^>]*/?>\s*", "", html)
+                    html, c["onattr"] = re.subn(r'\son\w+="[^"]*"', "", html)
+                else:
+                    html = re.sub(r"(<head\b[^>]*>)", lambda m: m.group(1) + STUBS, html, count=1)
+                diga("LIMPEZA: %s" % ", ".join("%s=%d" % (k, v) for k, v in c.items() if v))
+
+        if link:
+            # Padrão: TODA navegação (troca de página, link externo, botão de
+            # checkout, submit de formulário) vai para o link fornecido. O que
+            # permanece na página — âncoras internas (#) e interações de UI
+            # (FAQ, slider, menu) — não é tocado.
+            alvo = link.replace("\\", "\\\\").replace('"', "&quot;")
+
+            # (1) Reescrita estática do href dos <a> que trocam de página / são
+            #     externos (mantém âncoras internas), para o hover mostrar o link.
+            def troca_a(m):
+                tag = m.group(0)
+                if "data-clone-lang" in tag:
+                    return tag           # seletor de idioma: navegação interna
+                h = re.search(r'href="([^"]*)"', tag)
+                if h and (h.group(1).startswith("#") or h.group(1).startswith("javascript:")):
+                    return tag                       # âncora interna / js: preserva
+                if h:
+                    tag = re.sub(r'href="[^"]*"', 'href="%s"' % alvo, tag, count=1)
+                else:
+                    tag = tag[:2] + ' href="%s"' % alvo + tag[2:]
+                tag = re.sub(r'\son\w+="[^"]*"', "", tag)
+                tag = re.sub(r'\starget="[^"]*"', "", tag)
+                return tag
+
+            html, n_link = re.subn(r"<a\b[^>]*>", troca_a, html)
+            diga("LINK nos <a>: %d -> %s" % (n_link, link))
+
+            # (2) Snippet: sobrescreve funções de troca de página, intercepta
+            #     cliques que levam a outra página e o submit de formulários.
+            html = html.replace("</body>", link_snippet(link) + "\n</body>", 1) \
+                if "</body>" in html else html + link_snippet(link)
+
+        if redirect:
+            # depois da limpeza: entra no fim do <body> para rodar por último
+            snip = redirect_snippet(redirect)
+            if "</body>" in html:
+                html = html.replace("</body>", snip + "\n</body>", 1)
             else:
-                for t in TRACKER_INLINE:
-                    if t in corpo: porque = t; break
-            if not porque:
-                return m.group(0)
-            mortos.append(porque)
-            return ('<script type="text/plain" data-clone-disabled="%s"%s>%s</script>'
-                    % (porque, attrs, corpo))
+                html += snip
+            diga("REDIRECT: todo clique -> %s" % redirect)
+        return html
 
-        html = re.sub(r"<script\b([^>]*)>(.*?)</script>", mata, html, flags=re.S)
-        html, n_ns = re.subn(r"<noscript><iframe[^>]*(?:googletagmanager|facebook)[^>]*>.*?</noscript>",
-                             "<!-- tracker noscript removido -->", html, flags=re.S)
+    # ── 3b. idiomas ───────────────────────────────────────────────
+    # A tradução é feita no servidor (?lang=xx), então ela nunca vem no HTML
+    # baixado. O capturar.js busca cada versão de dentro da página (passa o
+    # Cloudflare) e aqui cada uma vira um arquivo próprio, com o seletor
+    # religado para navegar entre eles — sem servidor, sem query string.
+    idiomas = {k.lower(): v for k, v in (d.get("idiomas") or {}).items()}
+    atual = next((k for k, v in idiomas.items() if v.get("atual")), "") or \
+        (re.search(r'<html[^>]*\blang="([^"]+)"', html) or [None, ""])[1].lower()
+    traduzidas = {k: v for k, v in idiomas.items() if v.get("html") and k != atual}
+    mapa = {}
+    if traduzidas:
+        mapa[atual] = "index.html"
+        for c in traduzidas:
+            mapa[c] = ARQ_IDIOMA % re.sub(r"[^a-z0-9-]", "", c)
 
-        # pixels são <img>/<iframe>, não <script>: bloquear só o download
-        # deixaria a tag apontando para o rastreador e ela dispararia igual.
-        px = [0]
-
-        def minusculo(attrs):
-            """1x1 invisível não é interface — é beacon, venha de onde vier."""
-            def dim(nome):
-                m = re.search(r'\b%s="(\d+)' % nome, attrs) or \
-                    re.search(r'%s\s*:\s*(\d+)\s*px' % nome, attrs)
-                return int(m.group(1)) if m else None
-            l, a = dim("width"), dim("height")
-            return l is not None and a is not None and l <= 2 and a <= 2
-
-        def mata_pixel(m):
-            tag, attrs = m.group(1), m.group(2)
-            src = re.search(r'src="([^"]*)"', attrs)
-            # o src já virou "assets/xxx": a decisão olha a URL de ORIGEM.
-            alvo_src = src.group(1) if src else ""
-            origem = local2url.get(alvo_src.split("?")[0], alvo_src)
-            porque = None
-            if src and (eh_tracker(origem) or "saved_resource" in alvo_src):
-                porque = "pixel"
-            elif tag == "iframe" and minusculo(attrs):
-                porque = "iframe-1x1"          # inclusive sem src / about:blank
-            elif tag == "img" and src and minusculo(attrs) and eh_tracker(origem):
-                porque = "pixel-1x1"
-            if not porque:
-                return m.group(0)
-            limpo = re.sub(r'\ssrc="[^"]*"', "", attrs)
-            px[0] += 1
-            return '<%s%s data-clone-disabled="%s">' % (tag, limpo, porque)
-
-        html = re.sub(r"<(img|iframe)([^>]*)>", mata_pixel, html)
-        print("rastreadores encontrados: %d scripts, %d noscript, %d pixels/iframes"
-              % (len(mortos), n_ns, px[0]))
-
-        if not a.marcar:
-            # LIMPEZA TOTAL: tira o que foi marcado em vez de só desativar,
-            # e mais tudo que amarra a página ao servidor de origem.
-            c = {}
-            html, c["scripts"] = re.subn(
-                r"<script\b[^>]*data-clone-disabled[^>]*>.*?</script>\s*", "", html, flags=re.S)
-            html, c["iframes"] = re.subn(
-                r"<iframe\b[^>]*data-clone-disabled[^>]*>.*?</iframe>\s*", "", html, flags=re.S)
-            html, c["pixels"] = re.subn(
-                r"<(?:img|iframe)\b[^>]*data-clone-disabled[^>]*>\s*(?:</iframe>\s*)?", "", html)
-            html, c["noscript"] = re.subn(
-                r"<noscript>\s*(?:<!--[^>]*-->)?\s*</noscript>\s*", "", html)
-            # preconnect/dns-prefetch: só abrem conexão, nunca renderizam nada
-            html, c["hints"] = re.subn(
-                r'<link\b[^>]*rel="(?:preconnect|dns-prefetch)"[^>]*>\s*', "", html)
-            html, c["hints2"] = re.subn(
-                r'<link\b(?=[^>]*rel="(?:preconnect|dns-prefetch)")[^>]*>\s*', "", html)
-            # preload/prefetch que ainda apontam para fora
-            html, c["prefetch"] = re.subn(
-                r'<link\b[^>]*rel="(?:preconnect|dns-prefetch|prefetch|preload)"[^>]*href="https?://[^"]*"[^>]*>\s*',
-                "", html)
-            html, c["prefetch2"] = re.subn(
-                r'<link\b[^>]*href="https?://[^"]*"[^>]*rel="(?:preconnect|dns-prefetch|prefetch|preload)"[^>]*>\s*',
-                "", html)
-            # CSP herdada barra arquivo local
-            html, c["csp"] = re.subn(
-                r'<meta\b[^>]*http-equiv="[Cc]ontent-[Ss]ecurity-[Pp]olicy"[^>]*>\s*', "", html)
-            # integrity/nonce conferem hash do CDN e reprovam o arquivo local
-            html, c["attrs"] = re.subn(r'\s(?:integrity|nonce)="[^"]*"', "", html)
-            html, c["cross"] = re.subn(r'\scrossorigin(?:="[^"]*")?', "", html)
-            # links externos viram inertes
-            html, c["links"] = re.subn(
-                r'(<a\b[^>]*href=")https?://[^"]*(")',
-                lambda m: m.group(1) + "#" + m.group(2), html)
-            # atributos que guardam URL de destino do funil
-            html, c["dataurl"] = re.subn(
-                r'\s(?:data-go-to|data-href|data-url|data-redirect)="https?://[^"]*"', "", html)
-
-            if a.so_frontend:
-                # Só o frontend: remove TODO o JavaScript restante (UI,
-                # anti-bot, verificação de tráfego, cloaking). Sobram só
-                # HTML/CSS/imagens/fontes — e o redirect, injetado depois.
-                # Sem scripts do site, os stubs também são dispensáveis.
-                html, c["js"] = re.subn(
-                    r"<script\b(?![^>]*data-clone)[^>]*>.*?</script>\s*", "", html, flags=re.S)
-                html, c["jssrc"] = re.subn(
-                    r"<script\b(?![^>]*data-clone)[^>]*/?>\s*", "", html)
-                html, c["onattr"] = re.subn(r'\son\w+="[^"]*"', "", html)
+    def pagina(h, codigo):
+        h = relocalizar(h)
+        if mapa:
+            h, _ = marcar_idiomas(h, set(mapa) | set(idiomas))
+        h = montar(h)
+        if mapa:
+            snip = idioma_snippet(mapa, codigo)
+            # antes do snippet de --link: quem registra primeiro ganha o clique
+            if '<script data-clone="link">' in h:
+                h = h.replace('<script data-clone="link">', snip + "\n" + '<script data-clone="link">', 1)
+            elif "</body>" in h:
+                h = h.replace("</body>", snip + "\n</body>", 1)
             else:
-                html = re.sub(r"(<head\b[^>]*>)", lambda m: m.group(1) + STUBS, html, count=1)
-            print("LIMPEZA: %s" % ", ".join("%s=%d" % (k, v) for k, v in c.items() if v))
+                h += snip
+        return h
 
-    if link:
-        # Padrão: TODA navegação (troca de página, link externo, botão de
-        # checkout, submit de formulário) vai para o link fornecido. O que
-        # permanece na página — âncoras internas (#) e interações de UI
-        # (FAQ, slider, menu) — não é tocado.
-        alvo = link.replace("\\", "\\\\").replace('"', "&quot;")
-
-        # (1) Reescrita estática do href dos <a> que trocam de página / são
-        #     externos (mantém âncoras internas), para o hover mostrar o link.
-        def troca_a(m):
-            tag = m.group(0)
-            h = re.search(r'href="([^"]*)"', tag)
-            if h and (h.group(1).startswith("#") or h.group(1).startswith("javascript:")):
-                return tag                       # âncora interna / js: preserva
-            if h:
-                tag = re.sub(r'href="[^"]*"', 'href="%s"' % alvo, tag, count=1)
-            else:
-                tag = tag[:2] + ' href="%s"' % alvo + tag[2:]
-            tag = re.sub(r'\son\w+="[^"]*"', "", tag)
-            tag = re.sub(r'\starget="[^"]*"', "", tag)
-            return tag
-
-        html, n_link = re.subn(r"<a\b[^>]*>", troca_a, html)
-        print("LINK nos <a>: %d -> %s" % (n_link, link))
-
-        # (2) Snippet: sobrescreve funções de troca de página, intercepta
-        #     cliques que levam a outra página e o submit de formulários.
-        html = html.replace("</body>", link_snippet(link) + "\n</body>", 1) \
-            if "</body>" in html else html + link_snippet(link)
-
-    if redirect:
-        # depois da limpeza: entra no fim do <body> para rodar por último
-        snip = redirect_snippet(redirect)
-        if "</body>" in html:
-            html = html.replace("</body>", snip + "\n</body>", 1)
-        else:
-            html += snip
-        print("REDIRECT: todo clique -> %s" % redirect)
+    html = pagina(html, atual)
     io.open(os.path.join(out, "index.html"), "w",
             encoding="utf-8", errors="surrogatepass").write(html)
+
+    if traduzidas:
+        quieto[0] = True
+        for c, v in sorted(traduzidas.items()):
+            io.open(os.path.join(out, mapa[c]), "w", encoding="utf-8",
+                    errors="surrogatepass").write(pagina(v["html"], c))
+        quieto[0] = False
+        print("idiomas: %d páginas geradas (%s) — seletor religado para os arquivos locais"
+              % (len(traduzidas), ", ".join(sorted(traduzidas))))
+        faltam = sorted(set(idiomas) - set(mapa))
+        if faltam:
+            print("   sem página (não vieram na captura): %s — o clique nelas não faz nada, "
+                  "em vez de cair no link da oferta" % ", ".join(faltam))
+        iguais = [c for c, v in traduzidas.items() if v.get("igual")]
+        if iguais:
+            print("   AVISO: %s vieram do servidor com o mesmo tamanho do original — "
+                  "confira se a origem traduziu mesmo" % ", ".join(iguais))
+    elif idiomas:
+        print("idiomas: seletor detectado (%s) mas nenhuma tradução na captura — "
+              "recapture com o capturar.js atualizado" % ", ".join(sorted(idiomas)))
 
     # ── 4. reescreve url() dentro dos CSS ─────────────────────────
     n_css = 0

@@ -23,7 +23,16 @@ links `<a>` para uma URL fornecida.
    Atenção: o `src` do tracker pode ter sido reescrito para `assets/xxx.js`,
    escondendo o domínio; a decisão olha a **URL de origem**, não o nome local.
 
-3. **Mandar toda navegação para a URL fornecida** (`--link`). Qualquer coisa
+3. **Preservar o seletor de idioma de verdade.** A tradução dessas páginas
+   costuma ser feita no servidor (`?lang=en`), então ela **não vem** no HTML
+   baixado — o seletor fica bonito e morto. O `capturar.js` detecta o seletor,
+   descobre os códigos e busca cada versão traduzida por `fetch` same-origin
+   (de dentro da página ele leva o cookie do Cloudflare e passa onde `curl`
+   leva 403). O `clonar.py` gera `index-<código>.html` para cada uma e religa
+   o seletor para navegar entre os arquivos locais, sem query string. Idioma
+   detectado mas não capturado vira clique inerte — nunca cai no `--link`.
+
+4. **Mandar toda navegação para a URL fornecida** (`--link`). Qualquer coisa
    que levaria o visitante a **outra página** — link externo, `<a>` para outra
    página, botão de troca de página (`<button onclick="nextPage()">` e afins),
    submit de formulário — passa a apontar para a URL dada; o `href` visível
@@ -36,9 +45,18 @@ links `<a>` para uma URL fornecida.
   baixa um `.json` com o HTML e todos os assets. Roda no navegador para herdar
   a sessão e a VPN quando a página é geo-restrita.
 - **`clonar.py <captura.json> <nome> [--link "<url>"]`** — reconstrói em
-  `clones/<nome>/`, remove o rastreamento e, com `--link`, aponta os `<a>` para
-  a URL. Imprime uma auditoria — o esperado é `faltando: 0` e
-  `chamadas externas automáticas: nenhuma`.
+  `clones/<nome>/`, remove o rastreamento, gera as páginas de idioma e, com
+  `--link`, aponta os `<a>` para a URL. Imprime uma auditoria — o esperado é
+  `faltando: 0` e `chamadas externas automáticas: nenhuma`.
+
+  A decisão sobre o que é tracking tem **três níveis**, nesta ordem:
+  `TRACKER_DOMINIOS` (sai sempre: GTM, GA, Meta, Clarity, Hotjar, e redes de
+  afiliado como maxweb/Everflow/Voluum) → `UI_KEEP` (**fica sempre**: idioma,
+  i18n, slider, accordion, cronômetro, animação, máscara, validação…) →
+  `TRACKER_SRC` (padrões frouxos). Assim `/track.js` não leva junto um
+  `slick-track.js`. A decisão olha a **URL de origem**, resolvida de volta a
+  partir do caminho local — inclusive para `<img>` e `<iframe>`, e um
+  `<iframe>` 1x1 invisível é beacon por forma, venha de onde vier.
 - **`servir.py <nome> [porta]`** — serve em localhost com os MIME types certos
   (webp, webm, fontes).
 
@@ -51,6 +69,7 @@ tudo com caminhos relativos e editável à mão.
 
 Abrir `file:///home/gustavo/clonador-paginas/clones/<nome>/index.html` e checar:
 - visual idêntico ao original;
+- o seletor de idioma abre e cada opção troca o texto da página;
 - FAQ abrindo ao clicar, cronômetro correndo, sliders/animações rodando;
 - ao passar o mouse nos `<a>`, a barra de status mostra a URL fornecida.
 

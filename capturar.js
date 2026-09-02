@@ -10,6 +10,7 @@
   const t0 = Date.now();
   const abs = u => { try { return new URL(u, location.href).href; } catch { return null; } };
   const urls = new Set();
+  const log0 = [];
   const add = u => { const a = abs(u); if (a && /^https?:/.test(a)) urls.add(a); };
 
   // Domínios de tracking: baixá-los só gera erro de CORS e sujeira no clone.
@@ -64,6 +65,69 @@
     for (const m of cru.matchAll(/url\(\s*['"]?(?!data:)([^'")]+)/g)) add(m[1]);
   }
 
+  // ── 2c. IDIOMAS: descobre o seletor e busca cada versão traduzida ──
+  // A tradução é feita no SERVIDOR (?lang=xx), então ela não vem junto no
+  // download da página. Mas daqui de dentro dá: é fetch same-origin, leva o
+  // cookie de clearance do Cloudflare e passa onde curl leva 403.
+  const idiomas = {};
+  {
+    const norm = v => (v || '').trim().toLowerCase();
+    const valido = c => /^[a-z]{2}(-[a-z0-9]{2,8})?$/.test(c);
+    const atual = norm(document.documentElement.lang) ||
+                  norm(new URL(location.href).searchParams.get('lang'));
+
+    // Onde um seletor de idioma costuma estar. Só olhamos códigos que estão
+    // DENTRO de algo assim — senão qualquer data-value da página viraria idioma.
+    const DENTRO = '[class*="lang"],[class*="idioma"],[class*="locale"],' +
+                   '[class*="switcher"],[id*="lang"],[id*="locale"]';
+
+    const alvo = (el, c) => {
+      const d = el.getAttribute('data-url') || el.getAttribute('data-href') ||
+                el.getAttribute('href');
+      if (d && !/^(#|javascript:)/i.test(d)) {
+        const a = abs(d);
+        if (a && new URL(a).origin === location.origin) return a;
+      }
+      const u = new URL(location.href);        // igual ao que o seletor faz
+      u.searchParams.set('lang', c); u.hash = '';
+      return u.href;
+    };
+
+    const cand = new Map(), rotulo = new Map();
+    document.querySelectorAll(
+      '[data-value],[data-lang],[data-language],[data-locale],[hreflang],option[value]'
+    ).forEach(el => {
+      const c = norm(el.getAttribute('data-value') || el.getAttribute('data-lang') ||
+                     el.getAttribute('data-language') || el.getAttribute('data-locale') ||
+                     el.getAttribute('hreflang') || el.value);
+      if (!valido(c) || cand.has(c)) return;
+      if (!el.hasAttribute('hreflang') && !el.closest(DENTRO)) return;
+      cand.set(c, alvo(el, c));
+      rotulo.set(c, (el.textContent || c).trim().slice(0, 40));
+    });
+
+    if (cand.size > 1) {
+      console.log('%c seletor de idioma: ' + [...cand.keys()].join(', ') + ' ',
+                  'background:#222;color:#ff0');
+      const base = document.documentElement.outerHTML;
+      for (const [c, u] of cand) {
+        if (c === atual) { idiomas[c] = { url: location.href, atual: true }; continue; }
+        try {
+          const r = await fetch(u, { credentials: 'include' });
+          if (!r.ok) { log0.push('HTTP' + r.status + ' idioma ' + c); continue; }
+          const h = await r.text();
+          if (!/<html/i.test(h)) { log0.push('sem html idioma ' + c); continue; }
+          idiomas[c] = { url: u, html: h, rotulo: rotulo.get(c),
+                         igual: h.length === base.length };
+          // a versão traduzida pode trazer imagem/vídeo que a atual não tem
+          for (const m of h.matchAll(/(?:src|href|data-src|poster)=["']([^"']+)["']/g)) add(m[1]);
+          for (const m of h.matchAll(/url\(\s*['"]?(?!data:)([^'")]+)/g)) add(m[1]);
+          console.log('  idioma ' + c + ': ' + (h.length / 1024).toFixed(0) + 'KB');
+        } catch (e) { log0.push('ERR idioma ' + c); }
+      }
+    }
+  }
+
   // ── 3. CSS: extrai backgrounds e @font-face de dentro ─────────
   const seenCss = new Set();
   for (let round = 0; round < 2; round++) {          // 2 níveis (@import)
@@ -90,7 +154,7 @@
     const f = new FileReader(); f.onloadend = () => r(f.result.split(',')[1]); f.readAsDataURL(b);
   });
   const list = [...urls].filter(u => !SKIP.test(u));
-  const files = {}, log = [];
+  const files = {}, log = log0;
   let i = 0, bytes = 0;
   console.log('%c capturando ' + list.length + ' arquivos… ', 'background:#222;color:#0f0');
   for (const u of list) {
@@ -113,6 +177,7 @@
     capturedAt: new Date().toISOString(),
     viewport: { w: innerWidth, h: innerHeight },
     html: document.documentElement.outerHTML,
+    idiomas,
     files, log
   });
 
@@ -120,6 +185,9 @@
     (bytes / 1048576).toFixed(1) + 'MB · ' + ((Date.now() - t0) / 1000).toFixed(0) + 's ',
     'background:#222;color:#0f0');
   if (log.length) console.warn('não capturados (' + log.length + '):', log);
+  const nId = Object.keys(idiomas).filter(k => idiomas[k].html).length;
+  if (nId) console.log('%c ' + nId + ' idioma(s) traduzidos capturados: ' +
+    Object.keys(idiomas).join(', ') + ' ', 'background:#222;color:#ff0');
 
   const nome = 'captura-' + location.hostname.replace(/[^a-z0-9]+/gi, '-') + '.json';
   const a = document.createElement('a');
