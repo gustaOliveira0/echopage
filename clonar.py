@@ -9,6 +9,7 @@ grava os assets, reescreve HTML e CSS para caminhos locais, neutraliza
 rastreadores e audita o resultado.
 """
 import argparse, base64, hashlib, io, json, os, re, sys
+from html.parser import HTMLParser
 from urllib.parse import urlsplit, unquote
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
@@ -146,7 +147,7 @@ def redirect_snippet(dest):
             'var c=el.className;return (c.baseVal!==undefined?c.baseVal:c)+"";}\n'
             'function ui(el){while(el&&el!==document.documentElement){'
             'if(UI.test(cls(el)))return true;'
-            'if(el.getAttribute){if(el.hasAttribute("data-clone-lang"))return true;'
+            'if(el.getAttribute){if(el.hasAttribute("data-clone-lang")||el.hasAttribute("data-clone-ui"))return true;'
             'if(UI.test(el.getAttribute("id")||""))return true;'
             'var r=el.getAttribute("role")||"";if(/tab|menuitem|switch/.test(r))return true;}'
             'el=el.parentElement;}return false;}\n'
@@ -168,7 +169,136 @@ def redirect_snippet(dest):
             '})();\n</script>')
 
 
-ARQ_IDIOMA = "index-%s.html"
+# ══════════════════════════════════════════════════════════════════
+#  IDIOMAS
+#  Todo clone sai com um seletor de idioma próprio, injetado, que não
+#  depende do frontend da página: um botão flutuante isolado em Shadow
+#  DOM. A troca acontece na hora, trocando o texto pelo dicionário —
+#  sem recarregar, sem query string, sem servidor, sem chamada externa.
+# ══════════════════════════════════════════════════════════════════
+IDIOMAS_NOME = {
+    "pt-br": "Português (Brasil)", "pt": "Português", "en": "English",
+    "es": "Español", "fr": "Français", "de": "Deutsch", "it": "Italiano",
+    "nl": "Nederlands", "sv": "Svenska", "no": "Norsk", "da": "Dansk",
+    "fi": "Suomi", "pl": "Polski", "cs": "Čeština", "ro": "Română",
+    "hu": "Magyar", "el": "Ελληνικά", "tr": "Türkçe", "ru": "Русский",
+    "uk": "Українська", "ar": "العربية", "he": "עברית", "hi": "हिन्दी",
+    "id": "Bahasa Indonesia", "th": "ไทย", "vi": "Tiếng Việt",
+    "ja": "日本語", "ko": "한국어", "zh-hans": "简体中文", "zh-hant": "繁體中文",
+    "zh": "中文",
+}
+IDIOMAS_PADRAO = ["en", "es", "pt-br", "fr", "de", "it", "ja", "zh-hans"]
+IGNORA_TEXTO = {"script", "style", "noscript", "template", "svg", "code", "pre"}
+ATRIB_TEXTO = ("alt", "title", "placeholder", "aria-label")
+
+
+class _Segmentos(HTMLParser):
+    """Coleta o texto traduzível de um HTML, na ordem do documento.
+
+    Ordem importa: é ela que alinha a página original com a versão que o
+    servidor devolveu traduzida, já que as duas saem do mesmo template.
+    """
+
+    def __init__(self):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.mudo = []
+        self.textos = []
+        self.atributos = []
+        self.titulo = ""
+        self._em_titulo = False
+
+    def handle_starttag(self, tag, attrs):
+        # "English", "日本語" e afins são rótulos do seletor: cada um já está
+        # no próprio idioma e traduzi-los seria o oposto do que se quer.
+        rotulo = any(k in ("data-value", "data-lang", "data-language",
+                           "data-locale", "hreflang", "data-clone-lang")
+                     and (v or "").strip().lower() in IDIOMAS_NOME
+                     for k, v in attrs)
+        if tag in IGNORA_TEXTO or rotulo:
+            self.mudo.append(tag)
+        if tag == "title":
+            self._em_titulo = True
+        if self.mudo:
+            return
+        for k, v in attrs:
+            if k in ATRIB_TEXTO and v and v.strip() and _traduzivel(v):
+                self.atributos.append(v.strip())
+
+    def handle_endtag(self, tag):
+        if self.mudo and self.mudo[-1] == tag:
+            self.mudo.pop()
+        if tag == "title":
+            self._em_titulo = False
+
+    def handle_data(self, dado):
+        if self._em_titulo:
+            self.titulo = dado.strip()
+            return
+        if self.mudo:
+            return
+        t = dado.strip()
+        if t and _traduzivel(t):
+            self.textos.append(t)
+
+
+def _traduzivel(t):
+    """Só entra o que é frase de gente: precisa ter letra e não ser código."""
+    t = t.strip()
+    if len(t) < 2 or len(t) > 3000:
+        return False
+    if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ɏͰ-῿぀-퟿]", t):
+        return False
+    if re.match(r"^[\d\s.,:;/%+-]+$", t):
+        return False
+    if t.startswith(("{", "[", "<", "//", "/*")) or "function(" in t:
+        return False
+    return True
+
+
+def segmentos(html):
+    p = _Segmentos()
+    try:
+        p.feed(html)
+    except Exception:
+        pass
+    return p
+
+
+def dicionario_da_variante(html_base, html_var):
+    """Casa a página original com a versão traduzida pelo servidor.
+
+    As duas vêm do mesmo template, então o texto sai na mesma ordem e o
+    pareamento é posicional. Se as contagens divergem, a variante não é o
+    mesmo template — devolve vazio em vez de inventar um alinhamento torto.
+    """
+    b, v = segmentos(html_base), segmentos(html_var)
+    if len(b.textos) != len(v.textos) or len(b.atributos) != len(v.atributos):
+        return None, (len(b.textos), len(v.textos))
+    d = {}
+    for o, t in list(zip(b.textos, v.textos)) + list(zip(b.atributos, v.atributos)):
+        if o != t and t:
+            d.setdefault(o, t)
+    if b.titulo and v.titulo and b.titulo != v.titulo:
+        d[b.titulo] = v.titulo
+    return d, (len(b.textos), len(v.textos))
+
+
+def escrever_i18n(pasta, padrao, dicionarios, codigos):
+    """Grava i18n/dicionarios.js.
+
+    É .js e não .json de propósito: em file:// um fetch de .json morre em
+    CORS, e o CLAUDE.md manda conferir o clone abrindo o arquivo direto.
+    """
+    os.makedirs(pasta, exist_ok=True)
+    nomes = {c: IDIOMAS_NOME.get(c, c.upper()) for c in codigos}
+    corpo = {"padrao": padrao, "nomes": nomes,
+             "dic": {c: dicionarios.get(c, {}) for c in codigos if c != padrao}}
+    js = ("/* gerado pelo clonar.py — dicionários de tradução do clone.\n"
+          "   Editável à mão: chave = texto original, valor = tradução. */\n"
+          "window.__CLONE_I18N = " +
+          json.dumps(corpo, ensure_ascii=False, indent=1, sort_keys=True) + ";\n")
+    io.open(os.path.join(pasta, "dicionarios.js"), "w", encoding="utf-8").write(js)
+    return len(js)
 
 
 def marcar_idiomas(html, codigos):
@@ -179,6 +309,15 @@ def marcar_idiomas(html, codigos):
     """
     n = [0]
     ATRIB = r'(?:data-value|data-lang|data-language|data-locale|hreflang)'
+
+    # Se a página tem um seletor nativo, ele traz vários códigos de idioma
+    # juntos. Nesse caso marcamos todos os conhecidos, mesmo os sem
+    # dicionário: assim o clique fica inerte em vez de virar clique na
+    # oferta. Um data-value solto (3 códigos é o piso) não conta.
+    achados = {m.group(1).strip().lower() for m in re.finditer(
+        r'\b' + ATRIB + r'="([^"]*)"', html)}
+    if len(achados & set(IDIOMAS_NOME)) >= 3:
+        codigos = set(codigos) | (achados & set(IDIOMAS_NOME))
 
     def marca(m):
         tag, c = m.group(0), m.group(1).strip().lower()
@@ -192,32 +331,209 @@ def marcar_idiomas(html, codigos):
     return html, n[0]
 
 
-def idioma_snippet(mapa, atual):
-    """Troca de idioma sem servidor: cada opção leva ao arquivo local.
+CANTOS = {"bl": "left:16px;bottom:16px", "br": "right:16px;bottom:16px",
+          "tl": "left:16px;top:16px", "tr": "right:16px;top:16px"}
 
-    Roda ANTES do snippet de --link (registra o listener de captura primeiro),
-    senão o --link engoliria o clique e mandaria todo mundo para a oferta.
-    """
-    m = "{" + ",".join('"%s":"%s"' % (c, a) for c, a in sorted(mapa.items())) + "}"
-    return (
-        '<script data-clone="lang">\n'
-        '(function(){var M=' + m + ',ATUAL="' + atual + '";\n'
-        'function alvo(el){while(el&&el!==document.documentElement){'
-        'if(el.getAttribute&&el.hasAttribute("data-clone-lang"))'
-        'return M[el.getAttribute("data-clone-lang")]||"";'
-        'el=el.parentElement;}return null;}\n'
-        # o hover mostra o destino, e um <a> continua sendo um <a>
-        'function href(){var e=document.querySelectorAll("[data-clone-lang]");'
-        'for(var i=0;i<e.length;i++){var c=e[i].getAttribute("data-clone-lang");'
-        'if(M[c]&&e[i].tagName==="A")e[i].setAttribute("href",M[c]);}}\n'
-        'href();document.addEventListener("DOMContentLoaded",href);\n'
-        # marcado é sempre nosso: segura o clique mesmo sem página gerada,
-        # senão o --link mandaria quem clicou em "Deutsch" para a oferta.
-        'document.addEventListener("click",function(e){var u=alvo(e.target);'
-        'if(u===null)return;e.preventDefault();e.stopPropagation();'
-        'if(e.stopImmediatePropagation)e.stopImmediatePropagation();'
-        'if(u&&u!==M[ATUAL])location.href=u;},true);\n'
-        '})();\n</script>')
+_I18N_JS = r"""
+(function(){
+var CFG=window.__CLONE_I18N||{dic:{},nomes:{},padrao:"__PADRAO__"};
+var DIC=CFG.dic||{}, NOMES=CFG.nomes||{}, PADRAO=CFG.padrao||"__PADRAO__";
+var CHAVE="clone-i18n", AUTO=__AUTO__;
+var codigos=Object.keys(DIC);
+if(codigos.indexOf(PADRAO)<0)codigos.unshift(PADRAO);
+codigos.sort(function(a,b){return (NOMES[a]||a).localeCompare(NOMES[b]||b);});
+
+/* ── o que dá para traduzir na tela ───────────────────────────── */
+var nos=[],orig=[],ats=[],aorig=[],tit=document.title.trim(),atual=PADRAO;
+var MUDO=/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG|CODE|PRE)$/;
+
+function nosso(el){
+  while(el){ if(el.getAttribute&&el.hasAttribute("data-clone-ui"))return true;
+             el=el.parentNode||el.host; }
+  return false;
+}
+function coletar(){
+  nos=[];orig=[];ats=[];aorig=[];
+  if(!document.body)return;
+  var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false),n;
+  while((n=w.nextNode())){
+    var p=n.parentNode;
+    if(!p||MUDO.test(p.nodeName)||!n.nodeValue.trim()||nosso(p))continue;
+    nos.push(n);orig.push(n.nodeValue);
+  }
+  var A=["alt","title","placeholder","aria-label"];
+  var els=document.body.querySelectorAll("[alt],[title],[placeholder],[aria-label]");
+  for(var i=0;i<els.length;i++){
+    if(nosso(els[i]))continue;
+    for(var j=0;j<A.length;j++){
+      var v=els[i].getAttribute(A[j]);
+      if(v&&v.trim()){ats.push([els[i],A[j]]);aorig.push(v);}
+    }
+  }
+}
+
+/* Sempre parte do ORIGINAL guardado, nunca do texto já trocado: assim
+   trocar de idioma dez vezes seguidas dá no mesmo que trocar uma. */
+function aplicar(cod,silencioso){
+  var d=DIC[cod]||null,i,o,k,t;
+  for(i=0;i<nos.length;i++){
+    o=orig[i];k=o.trim();t=d&&d[k];
+    nos[i].nodeValue=t?o.replace(k,t):o;
+  }
+  for(i=0;i<ats.length;i++){
+    o=aorig[i];k=o.trim();t=d&&d[k];
+    ats[i][0].setAttribute(ats[i][1],t?o.replace(k,t):o);
+  }
+  document.title=(d&&d[tit])||tit;
+  document.documentElement.setAttribute("lang",cod);
+  atual=cod;
+  if(!silencioso){try{localStorage.setItem(CHAVE,cod);}catch(_){}}
+  /* o seletor nativo da página, se existir, acompanha a escolha */
+  var op=document.querySelectorAll("[data-clone-lang]");
+  for(i=0;i<op.length;i++){
+    var c=op[i].getAttribute("data-clone-lang");
+    if(op[i].classList)op[i].classList[c===cod?"add":"remove"]("active");
+  }
+  var dl=document.querySelector(".default-lang,.current-lang,[data-lang-atual]");
+  if(dl&&!nosso(dl))dl.textContent=NOMES[cod]||cod;
+  pintar();
+}
+
+/* ── botão flutuante, isolado da página em Shadow DOM ──────────── */
+var host,sh,pill,menu;
+var ESTILO='<style>'+
+':host{all:initial;display:block;position:fixed;z-index:2147483647;__CANTO__}'+
+'*{box-sizing:border-box;font:500 13px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}'+
+'.pill{display:flex;align-items:center;gap:7px;padding:9px 13px;border:1px solid rgba(15,15,15,.14);'+
+ 'border-radius:999px;background:#fff;color:#1a1a1a;cursor:pointer;'+
+ 'box-shadow:0 2px 10px rgba(0,0,0,.13),0 0 0 1px rgba(255,255,255,.6);'+
+ 'transition:transform .12s ease,box-shadow .12s ease}'+
+'.pill:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,.18)}'+
+'.pill svg{flex:0 0 auto}'+
+'.ch{opacity:.5;font-size:10px;transition:transform .18s}'+
+'.aberto .ch{transform:rotate(180deg)}'+
+'.menu{position:absolute;min-width:190px;max-height:60vh;overflow:auto;padding:6px;'+
+ 'background:#fff;color:#1a1a1a;border:1px solid rgba(15,15,15,.14);border-radius:12px;'+
+ 'box-shadow:0 8px 30px rgba(0,0,0,.2);__MENUPOS__}'+
+'.menu[hidden]{display:none}'+
+'.cod{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'+
+'.cur{display:none;font-weight:700;letter-spacing:.02em}'+
+'@media (max-width:520px){'+
+ '.pill{padding:10px 12px}'+
+ '.cod{display:none}.cur{display:inline}'+
+ '.menu{position:fixed;left:10px;right:10px;width:auto;min-width:0;'+
+  'max-height:min(58vh,420px);__MENUMOB__}'+
+ '.it{padding:12px 12px;font-size:15px}'+
+'}'+
+'@media (hover:none){.it{padding:13px 12px}}'+
+
+'.it{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;'+
+ 'padding:8px 10px;border:0;border-radius:8px;background:none;color:inherit;'+
+ 'text-align:left;cursor:pointer;font:inherit}'+
+'.it:hover{background:rgba(15,15,15,.06)}'+
+'.it[aria-selected="true"]{background:#e9f2ff;color:#0b63ce;font-weight:600}'+
+'.tick{opacity:0}.it[aria-selected="true"] .tick{opacity:1}'+
+'@media (prefers-color-scheme:dark){'+
+ '.pill,.menu{background:#1f2023;color:#f0f0f0;border-color:rgba(255,255,255,.16);'+
+  'box-shadow:0 2px 10px rgba(0,0,0,.5)}'+
+ '.it:hover{background:rgba(255,255,255,.09)}'+
+ '.it[aria-selected="true"]{background:#16324f;color:#8ab8f5}}'+
+'</style>';
+var GLOBO='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" '+
+ 'stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18'+
+ 'a15 15 0 0 1 0-18"/></svg>';
+
+function pintar(){
+  if(!sh)return;
+  sh.querySelector(".cod").textContent=NOMES[atual]||atual.toUpperCase();
+  sh.querySelector(".cur").textContent=atual.split("-")[0].toUpperCase();
+  var its=sh.querySelectorAll(".it");
+  for(var i=0;i<its.length;i++)
+    its[i].setAttribute("aria-selected",its[i].dataset.cod===atual?"true":"false");
+}
+function abrir(v){
+  if(v)menu.removeAttribute("hidden");else menu.setAttribute("hidden","");
+  pill.classList[v?"add":"remove"]("aberto");
+  pill.setAttribute("aria-expanded",v?"true":"false");
+}
+function montar(){
+  if(codigos.length<2)return;              /* um idioma só: sem botão */
+  host=document.createElement("div");
+  host.setAttribute("data-clone-ui","i18n");
+  host.setAttribute("data-clone-widget","i18n");
+  host.style.cssText="position:fixed;z-index:2147483647";
+  sh=host.attachShadow({mode:"open"});
+  var itens="";
+  for(var i=0;i<codigos.length;i++)
+    itens+='<button class="it" role="option" data-cod="'+codigos[i]+'">'+
+           '<span>'+(NOMES[codigos[i]]||codigos[i])+'</span><span class="tick">✓</span></button>';
+  sh.innerHTML=ESTILO+
+    '<button class="pill" aria-haspopup="listbox" aria-expanded="false" aria-label="Idioma">'+
+    GLOBO+'<span class="cod"></span><span class="cur"></span><span class="ch">▾</span></button>'+
+    '<div class="menu" role="listbox" hidden>'+itens+'</div>';
+  document.body.appendChild(host);
+  pill=sh.querySelector(".pill");menu=sh.querySelector(".menu");
+  pill.addEventListener("click",function(e){
+    e.stopPropagation();abrir(menu.hasAttribute("hidden"));});
+  var its=sh.querySelectorAll(".it");
+  for(var i=0;i<its.length;i++)its[i].addEventListener("click",function(e){
+    e.stopPropagation();aplicar(this.dataset.cod);abrir(false);});
+  document.addEventListener("click",function(){if(menu)abrir(false);});
+  addEventListener("keydown",function(e){if(e.key==="Escape")abrir(false);});
+}
+
+/* Seletor nativo da página (marcado com data-clone-lang) troca o idioma
+   pelo mesmo caminho. Captura, e antes do snippet de --link, senão o
+   clique em "English" viraria clique na oferta. */
+document.addEventListener("click",function(e){
+  var el=e.target;
+  while(el&&el!==document.documentElement){
+    if(el.getAttribute&&el.hasAttribute("data-clone-lang")){
+      var c=el.getAttribute("data-clone-lang");
+      e.preventDefault();e.stopPropagation();
+      if(e.stopImmediatePropagation)e.stopImmediatePropagation();
+      if(c===PADRAO||DIC[c])aplicar(c);
+      return;
+    }
+    el=el.parentElement;
+  }
+},true);
+
+function iniciar(){
+  coletar();montar();
+  var esc=null;
+  try{esc=localStorage.getItem(CHAVE);}catch(_){}
+  /* A 1ª visita abre no idioma padrão escolhido no comando. Só com
+     --idioma-auto a página tenta adivinhar pelo idioma do navegador. */
+  if(!esc&&AUTO){
+    var n=(navigator.language||"").toLowerCase();
+    if(DIC[n])esc=n;
+    else{var b=n.split("-")[0];
+         for(var i=0;i<codigos.length;i++)
+           if(codigos[i]===b||codigos[i].split("-")[0]===b){esc=codigos[i];break;}}
+  }
+  aplicar(esc&&(DIC[esc]||esc===PADRAO)?esc:PADRAO,true);
+}
+if(document.readyState==="loading")
+  document.addEventListener("DOMContentLoaded",iniciar);
+else iniciar();
+})();
+"""
+
+
+def i18n_snippet(padrao, canto="bl", auto=False):
+    pos = CANTOS.get(canto, CANTOS["bl"])
+    menupos = ("bottom:calc(100% + 8px);left:0" if canto[0] == "b" else
+               "top:calc(100% + 8px);left:0")
+    if canto[1] == "r":
+        menupos = menupos.replace("left:0", "right:0")
+    menumob = "bottom:72px" if canto[0] == "b" else "top:72px"
+    js = (_I18N_JS.replace("__PADRAO__", padrao)
+                  .replace("__CANTO__", pos)
+                  .replace("__MENUPOS__", menupos)
+                  .replace("__MENUMOB__", menumob)
+                  .replace("__AUTO__", "1" if auto else "0"))
+    return '<script data-clone="i18n">' + js + "</script>"
 
 
 def link_snippet(dest):
@@ -240,7 +556,7 @@ def link_snippet(dest):
         'var c=el.className;return (c.baseVal!==undefined?c.baseVal:c)+"";}\n'
         'function ui(el){while(el&&el!==document.documentElement){'
         'if(UI.test(cls(el)))return true;if(el.getAttribute){'
-        'if(el.hasAttribute("data-clone-lang"))return true;'
+        'if(el.hasAttribute("data-clone-lang")||el.hasAttribute("data-clone-ui"))return true;'
         'if(UI.test(el.getAttribute("id")||""))return true;'
         'var r=el.getAttribute("role")||"";if(/tab|menuitem|switch/.test(r))return true;}'
         'el=el.parentElement;}return false;}\n'
@@ -525,7 +841,8 @@ def podar_css(assets):
 
 
 def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
-                marcar=False, redirect="", so_frontend=False, link=""):
+                marcar=False, redirect="", so_frontend=False, link="",
+                idioma="", idiomas="", idioma_pos="bl", sem_idiomas=False, idioma_auto=False):
     """Monta o clone local a partir de um dicionário de captura.
 
     Mesmo formato produzido por capturar.js (navegador) e por
@@ -788,60 +1105,97 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             diga("REDIRECT: todo clique -> %s" % redirect)
         return html
 
+    html = relocalizar(html)
+
     # ── 3b. idiomas ───────────────────────────────────────────────
-    # A tradução é feita no servidor (?lang=xx), então ela nunca vem no HTML
-    # baixado. O capturar.js busca cada versão de dentro da página (passa o
-    # Cloudflare) e aqui cada uma vira um arquivo próprio, com o seletor
-    # religado para navegar entre eles — sem servidor, sem query string.
-    idiomas = {k.lower(): v for k, v in (d.get("idiomas") or {}).items()}
-    atual = next((k for k, v in idiomas.items() if v.get("atual")), "") or \
-        (re.search(r'<html[^>]*\blang="([^"]+)"', html) or [None, ""])[1].lower()
-    traduzidas = {k: v for k, v in idiomas.items() if v.get("html") and k != atual}
-    mapa = {}
-    if traduzidas:
-        mapa[atual] = "index.html"
-        for c in traduzidas:
-            mapa[c] = ARQ_IDIOMA % re.sub(r"[^a-z0-9-]", "", c)
+    # Todo clone sai com seletor de idioma, tenha a página um ou não: um
+    # botão flutuante isolado em Shadow DOM, que não depende do frontend
+    # dela. As traduções vêm de duas fontes, nesta ordem:
+    #   1. a versão que o servidor de origem devolveu (capturar.js as busca);
+    #   2. i18n/<código>.json escrito à mão na pasta do clone.
+    # Sem dicionário, o idioma não entra na lista — melhor faltar opção do
+    # que oferecer uma que não traduz nada.
+    vindos = {k.lower(): v for k, v in (d.get("idiomas") or {}).items()}
+    lang_html = (re.search(r'<html[^>]*\blang="([^"]+)"', html) or [None, ""])[1].lower()
+    padrao = (idioma or next((k for k, v in vindos.items() if v.get("atual")), "")
+              or lang_html or "pt-br").lower()
 
-    def pagina(h, codigo):
-        h = relocalizar(h)
-        if mapa:
-            h, _ = marcar_idiomas(h, set(mapa) | set(idiomas))
-        h = montar(h)
-        if mapa:
-            snip = idioma_snippet(mapa, codigo)
-            # antes do snippet de --link: quem registra primeiro ganha o clique
-            if '<script data-clone="link">' in h:
-                h = h.replace('<script data-clone="link">', snip + "\n" + '<script data-clone="link">', 1)
-            elif "</body>" in h:
-                h = h.replace("</body>", snip + "\n</body>", 1)
-            else:
-                h += snip
-        return h
+    oferecidos = [c.strip().lower() for c in idiomas.split(",") if c.strip()] or \
+        sorted(vindos) or list(IDIOMAS_PADRAO)
+    if padrao not in oferecidos:
+        oferecidos.insert(0, padrao)
 
-    html = pagina(html, atual)
+    pasta_i18n = os.path.join(out, "i18n")
+    dicio, fonte = {}, {}
+    base_para_dic = html            # antes de qualquer injeção nossa
+
+    # (1) das versões traduzidas trazidas pela captura
+    for c, v in sorted(vindos.items()):
+        if c == padrao or not v.get("html"):
+            continue
+        dic, cont = dicionario_da_variante(base_para_dic, v["html"])
+        if dic:
+            dicio[c], fonte[c] = dic, "origem"
+        else:
+            print("   idioma %s: %d vs %d segmentos — template diferente, ignorado"
+                  % (c, cont[0], cont[1]))
+
+    # (2) dicionários escritos à mão completam ou substituem
+    if os.path.isdir(pasta_i18n):
+        for fn in sorted(os.listdir(pasta_i18n)):
+            if not fn.endswith(".json") or fn.startswith("_"):
+                continue
+            c = fn[:-5].lower()
+            try:
+                m = json.load(io.open(os.path.join(pasta_i18n, fn), encoding="utf-8"))
+            except Exception as e:
+                print("   i18n/%s ilegível: %s" % (fn, e))
+                continue
+            if isinstance(m, dict):
+                m = {k: v for k, v in m.items() if isinstance(v, str) and v.strip()}
+            if m:
+                dicio.setdefault(c, {}).update(m)
+                fonte[c] = "origem+arquivo" if fonte.get(c) == "origem" else "arquivo"
+
+    codigos = [padrao] + [c for c in oferecidos if c != padrao and dicio.get(c)]
+    faltando_dic = [c for c in oferecidos if c != padrao and not dicio.get(c)]
+
+    if sem_idiomas:
+        html = montar(html)
+    else:
+        html, n_marc = marcar_idiomas(html, set(codigos) | set(vindos))
+        html = montar(html)
+        os.makedirs(pasta_i18n, exist_ok=True)
+        escrever_i18n(pasta_i18n, padrao, dicio, codigos)
+        # dicionário antes do widget, widget antes do --link: quem registra
+        # o clique primeiro ganha a troca de idioma.
+        snip = ('<script src="i18n/dicionarios.js"></script>\n'
+                + i18n_snippet(padrao, idioma_pos, idioma_auto))
+        marca_link = '<script data-clone="link">'
+        if marca_link in html:
+            html = html.replace(marca_link, snip + "\n" + marca_link, 1)
+        elif "</body>" in html:
+            html = html.replace("</body>", snip + "\n</body>", 1)
+        else:
+            html += snip
+        print("idiomas: padrão %s | no seletor: %s%s"
+              % (padrao, ", ".join(codigos),
+                 " | %d opções nativas religadas" % n_marc if n_marc else ""))
+        for c in codigos:
+            if c != padrao:
+                print("   %-9s %4d termos (%s)" % (c, len(dicio[c]), fonte.get(c, "?")))
+        if faltando_dic:
+            base = segmentos(html)      # já limpo: sem sobra de tracker
+            termos = sorted(set(base.textos) | set(base.atributos) |
+                            ({base.titulo} if base.titulo else set()))
+            io.open(os.path.join(pasta_i18n, "_base.json"), "w", encoding="utf-8").write(
+                json.dumps({t: "" for t in termos}, ensure_ascii=False, indent=1))
+            print("   sem dicionário: %s" % ", ".join(faltando_dic))
+            print("   -> %d termos em i18n/_base.json; preencha e salve como "
+                  "i18n/<código>.json, depois rode de novo" % len(termos))
+
     io.open(os.path.join(out, "index.html"), "w",
             encoding="utf-8", errors="surrogatepass").write(html)
-
-    if traduzidas:
-        quieto[0] = True
-        for c, v in sorted(traduzidas.items()):
-            io.open(os.path.join(out, mapa[c]), "w", encoding="utf-8",
-                    errors="surrogatepass").write(pagina(v["html"], c))
-        quieto[0] = False
-        print("idiomas: %d páginas geradas (%s) — seletor religado para os arquivos locais"
-              % (len(traduzidas), ", ".join(sorted(traduzidas))))
-        faltam = sorted(set(idiomas) - set(mapa))
-        if faltam:
-            print("   sem página (não vieram na captura): %s — o clique nelas não faz nada, "
-                  "em vez de cair no link da oferta" % ", ".join(faltam))
-        iguais = [c for c, v in traduzidas.items() if v.get("igual")]
-        if iguais:
-            print("   AVISO: %s vieram do servidor com o mesmo tamanho do original — "
-                  "confira se a origem traduziu mesmo" % ", ".join(iguais))
-    elif idiomas:
-        print("idiomas: seletor detectado (%s) mas nenhuma tradução na captura — "
-              "recapture com o capturar.js atualizado" % ", ".join(sorted(idiomas)))
 
     # ── 4. reescreve url() dentro dos CSS ─────────────────────────
     n_css = 0
@@ -975,6 +1329,18 @@ def main():
                     help="só marca os rastreadores (type=text/plain) em vez de removê-los")
     ap.add_argument("--link", default="", metavar="URL",
                     help="troca o href de todos os <a> por esta URL (só os <a>)")
+    ap.add_argument("--idioma", default="", metavar="COD",
+                    help="idioma padrão do clone (ex.: pt-br). Padrão: o <html lang> da página")
+    ap.add_argument("--idiomas", default="", metavar="LISTA",
+                    help="idiomas oferecidos no seletor, separados por vírgula. "
+                         "Padrão: os que a página já oferece, ou " + ",".join(IDIOMAS_PADRAO))
+    ap.add_argument("--idioma-pos", default="bl", choices=sorted(CANTOS),
+                    help="canto do botão flutuante: bl/br/tl/tr (padrão bl)")
+    ap.add_argument("--idioma-auto", action="store_true",
+                    help="na 1ª visita, abre no idioma do navegador se houver "
+                         "dicionário (padrão: abre sempre em --idioma)")
+    ap.add_argument("--sem-idiomas", action="store_true",
+                    help="não injeta o seletor de idioma")
     ap.add_argument("--redirect", default="", metavar="URL",
                     help="(avançado) intercepta todo clique de CTA e leva a esta URL")
     ap.add_argument("--so-frontend", action="store_true",
@@ -991,7 +1357,9 @@ def main():
     reconstruir(json.load(open(a.json)), a.nome,
                 offline=a.offline, manter_trackers=a.manter_trackers,
                 bloquear=a.bloquear, marcar=a.marcar, redirect=a.redirect,
-                so_frontend=a.so_frontend, link=a.link)
+                so_frontend=a.so_frontend, link=a.link,
+                idioma=a.idioma, idiomas=a.idiomas, idioma_pos=a.idioma_pos,
+                sem_idiomas=a.sem_idiomas, idioma_auto=a.idioma_auto)
 
 
 if __name__ == "__main__":

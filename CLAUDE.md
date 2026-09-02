@@ -23,14 +23,28 @@ links `<a>` para uma URL fornecida.
    Atenção: o `src` do tracker pode ter sido reescrito para `assets/xxx.js`,
    escondendo o domínio; a decisão olha a **URL de origem**, não o nome local.
 
-3. **Preservar o seletor de idioma de verdade.** A tradução dessas páginas
-   costuma ser feita no servidor (`?lang=en`), então ela **não vem** no HTML
-   baixado — o seletor fica bonito e morto. O `capturar.js` detecta o seletor,
-   descobre os códigos e busca cada versão traduzida por `fetch` same-origin
-   (de dentro da página ele leva o cookie do Cloudflare e passa onde `curl`
-   leva 403). O `clonar.py` gera `index-<código>.html` para cada uma e religa
-   o seletor para navegar entre os arquivos locais, sem query string. Idioma
-   detectado mas não capturado vira clique inerte — nunca cai no `--link`.
+3. **Todo clone sai com seletor de idioma próprio.** A página pode ter um ou
+   não — o clonador injeta o dele: um botão flutuante isolado em Shadow DOM,
+   responsivo, que não depende do CSS nem do JS do site. A troca é na hora,
+   trocando o texto pelo dicionário: sem recarregar, sem query string, sem
+   servidor, sem chamada externa. O idioma em que a página abre é o do
+   `--idioma`; a escolha do visitante fica no `localStorage`.
+
+   As traduções vêm de duas fontes, nesta ordem:
+
+   a. **Do próprio site.** Muitas dessas páginas traduzem no servidor
+      (`?lang=en`), então a tradução não vem no HTML baixado. O `capturar.js`
+      detecta o seletor nativo, descobre os códigos e busca cada versão por
+      `fetch` same-origin — de dentro da página ele leva o cookie do
+      Cloudflare e passa onde `curl` leva 403. O `clonar.py` casa a original
+      com a traduzida (mesmo template, mesma ordem de texto) e vira dicionário.
+   b. **De `i18n/<código>.json`**, escrito à mão na pasta do clone. Chave =
+      texto original, valor = tradução. Para o que falta, o `clonar.py` grava
+      `i18n/_base.json` com todos os termos da página, prontos para preencher.
+
+   Idioma sem dicionário não entra na lista. Se a página tem seletor nativo,
+   as opções dele são religadas ao mesmo mecanismo, e as sem dicionário ficam
+   inertes — nunca caem no `--link`.
 
 4. **Mandar toda navegação para a URL fornecida** (`--link`). Qualquer coisa
    que levaria o visitante a **outra página** — link externo, `<a>` para outra
@@ -57,19 +71,25 @@ links `<a>` para uma URL fornecida.
   `slick-track.js`. A decisão olha a **URL de origem**, resolvida de volta a
   partir do caminho local — inclusive para `<img>` e `<iframe>`, e um
   `<iframe>` 1x1 invisível é beacon por forma, venha de onde vier.
+  Opções de idioma: `--idioma <cod>` (o padrão do clone), `--idiomas a,b,c`
+  (os oferecidos), `--idioma-pos bl|br|tl|tr` (canto do botão),
+  `--idioma-auto` (1ª visita segue o navegador), `--sem-idiomas`.
+
 - **`servir.py <nome> [porta]`** — serve em localhost com os MIME types certos
   (webp, webm, fontes).
 
 ## Organização
 
-Uma pasta por site em `clones/<nome>/`, contendo `index.html` + `assets/`,
-tudo com caminhos relativos e editável à mão.
+Uma pasta por site em `clones/<nome>/`, contendo `index.html`, `assets/` e
+`i18n/` (`dicionarios.js` gerado + os `<código>.json` de origem), tudo com
+caminhos relativos e editável à mão.
 
 ## Conferir antes de entregar
 
 Abrir `file:///home/gustavo/clonador-paginas/clones/<nome>/index.html` e checar:
 - visual idêntico ao original;
-- o seletor de idioma abre e cada opção troca o texto da página;
+- o botão flutuante de idioma abre e cada opção troca o texto na hora,
+  inclusive no celular (largura estreita);
 - FAQ abrindo ao clicar, cronômetro correndo, sliders/animações rodando;
 - ao passar o mouse nos `<a>`, a barra de status mostra a URL fornecida.
 
