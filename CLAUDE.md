@@ -23,28 +23,39 @@ links `<a>` para uma URL fornecida.
    Atenção: o `src` do tracker pode ter sido reescrito para `assets/xxx.js`,
    escondendo o domínio; a decisão olha a **URL de origem**, não o nome local.
 
-3. **Todo clone sai com seletor de idioma próprio.** A página pode ter um ou
-   não — o clonador injeta o dele: um botão flutuante isolado em Shadow DOM,
-   responsivo, que não depende do CSS nem do JS do site. A troca é na hora,
-   trocando o texto pelo dicionário: sem recarregar, sem query string, sem
-   servidor, sem chamada externa. O idioma em que a página abre é o do
-   `--idioma`; a escolha do visitante fica no `localStorage`.
+3. **Todo clone sai traduzido nos idiomas pedidos.** No comando entram os
+   idiomas; o **primeiro é o padrão** e todos ficam disponíveis para trocar
+   no site:
 
-   As traduções vêm de duas fontes, nesta ordem:
+   ```
+   ./clonar.py captura.json nome --link "<url>" --idiomas "pt-br,en,de"
+   ```
 
-   a. **Do próprio site.** Muitas dessas páginas traduzem no servidor
-      (`?lang=en`), então a tradução não vem no HTML baixado. O `capturar.js`
-      detecta o seletor nativo, descobre os códigos e busca cada versão por
-      `fetch` same-origin — de dentro da página ele leva o cookie do
-      Cloudflare e passa onde `curl` leva 403. O `clonar.py` casa a original
-      com a traduzida (mesmo template, mesma ordem de texto) e vira dicionário.
-   b. **De `i18n/<código>.json`**, escrito à mão na pasta do clone. Chave =
-      texto original, valor = tradução. Para o que falta, o `clonar.py` grava
-      `i18n/_base.json` com todos os termos da página, prontos para preencher.
+   O botão de troca é injetado pelo clonador — a página pode ter um seletor
+   ou não. É um botão flutuante isolado em Shadow DOM, responsivo, que não
+   depende do CSS nem do JS do site. A troca é na hora, trocando o texto pelo
+   dicionário: sem recarregar, sem query string, sem servidor, sem chamada
+   externa. A escolha do visitante fica no `localStorage`.
 
-   Idioma sem dicionário não entra na lista. Se a página tem seletor nativo,
-   as opções dele são religadas ao mesmo mecanismo, e as sem dicionário ficam
-   inertes — nunca caem no `--link`.
+   A página clonada está no idioma que está (o `<html lang>`, ou
+   `--idioma-origem`). Todo idioma pedido que não seja esse ganha dicionário,
+   nesta ordem de fonte:
+
+   a. **A versão que o site de origem devolveu.** Muitas dessas páginas
+      traduzem no servidor (`?lang=en`), e isso não vem no HTML baixado. O
+      `capturar.js` detecta o seletor nativo e busca cada versão por `fetch`
+      same-origin — de dentro da página ele leva o cookie do Cloudflare e
+      passa onde `curl` leva 403. O `clonar.py` casa original com traduzida
+      (mesmo template, mesma ordem de texto). Autêntico e de graça.
+   b. **`i18n/<código>.json` já na pasta** — cache das rodadas anteriores,
+      editável à mão (chave = texto original, valor = tradução).
+   c. **Tradução na hora**, chamando `claude -p` em lotes de 40 termos, com
+      conferência chave a chave e uma segunda tentativa para o que faltar. O
+      resultado é salvo como `i18n/<código>.json`, então só se paga uma vez.
+      `--sem-traduzir` desliga.
+
+   Uma landing típica dá ~150 termos: ~2 min por idioma. Rótulo de idioma
+   ("English", "日本語") não entra — cada um já está no próprio idioma.
 
 4. **Mandar toda navegação para a URL fornecida** (`--link`). Qualquer coisa
    que levaria o visitante a **outra página** — link externo, `<a>` para outra
@@ -71,9 +82,10 @@ links `<a>` para uma URL fornecida.
   `slick-track.js`. A decisão olha a **URL de origem**, resolvida de volta a
   partir do caminho local — inclusive para `<img>` e `<iframe>`, e um
   `<iframe>` 1x1 invisível é beacon por forma, venha de onde vier.
-  Opções de idioma: `--idioma <cod>` (o padrão do clone), `--idiomas a,b,c`
-  (os oferecidos), `--idioma-pos bl|br|tl|tr` (canto do botão),
-  `--idioma-auto` (1ª visita segue o navegador), `--sem-idiomas`.
+  Opções de idioma: `--idiomas a,b,c` (disponíveis; o 1º é o padrão),
+  `--idioma-origem <cod>` (idioma da página capturada), `--sem-traduzir`,
+  `--idioma-pos bl|br|tl|tr` (canto do botão), `--idioma-auto` (1ª visita
+  segue o navegador), `--sem-idiomas`.
 
 - **`servir.py <nome> [porta]`** — serve em localhost com os MIME types certos
   (webp, webm, fontes).

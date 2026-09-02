@@ -283,7 +283,72 @@ def dicionario_da_variante(html_base, html_var):
     return d, (len(b.textos), len(v.textos))
 
 
-def escrever_i18n(pasta, padrao, dicionarios, codigos):
+def traduzir_termos(termos, origem, destino, lote=40, quieto=False):
+    """Traduz uma lista de termos chamando o CLI do Claude (`claude -p`).
+
+    Em lotes: um pedido único com 150 frases volta truncado ou com chave
+    faltando. Cada lote é conferido chave a chave e o que não voltou entra
+    numa segunda tentativa; o que ainda faltar fica sem tradução (o widget
+    mostra o original) em vez de virar texto inventado.
+    """
+    import subprocess
+    if not termos:
+        return {}
+    alvo_nome = IDIOMAS_NOME.get(destino, destino)
+    orig_nome = IDIOMAS_NOME.get(origem, origem)
+    saida = {}
+
+    def pedir(chaves):
+        pedido = json.dumps({k: "" for k in chaves}, ensure_ascii=False)
+        prompt = (
+            "Você é tradutor de landing page publicitária.\n"
+            "Traduza de %s (%s) para %s (%s).\n\n"
+            "REGRAS\n"
+            "- Responda SÓ com um objeto JSON, sem cercas de código, sem comentários.\n"
+            "- Mesmas chaves, exatamente como vieram. Só os valores mudam.\n"
+            "- Mantenha nomes de marca, nomes de pessoa, endereços, códigos e "
+            "números como estão.\n"
+            "- Preserve pontuação de borda, aspas soltas e espaços do começo/fim: "
+            "muitas frases são pedaços de uma sentença maior.\n"
+            "- Mantenha o tom comercial e o comprimento parecido — o texto entra "
+            "num layout pronto.\n"
+            "- Se um valor não fizer sentido traduzir, repita o original.\n\n"
+            "%s" % (origem, orig_nome, destino, alvo_nome, pedido))
+        try:
+            r = subprocess.run(["claude", "-p", prompt], capture_output=True,
+                               text=True, timeout=600, stdin=subprocess.DEVNULL)
+        except Exception as e:
+            print("      erro ao chamar o claude: %s" % e)
+            return {}
+        txt = (r.stdout or "").strip()
+        if "```" in txt:
+            txt = re.sub(r"^.*?```(?:json)?\s*|\s*```.*$", "", txt, flags=re.S)
+        i, f = txt.find("{"), txt.rfind("}")
+        if i < 0 or f < i:
+            return {}
+        try:
+            m = json.loads(txt[i:f + 1])
+        except Exception:
+            return {}
+        return {k: v for k, v in m.items()
+                if k in chaves and isinstance(v, str) and v.strip()}
+
+    blocos = [termos[i:i + lote] for i in range(0, len(termos), lote)]
+    for n, bloco in enumerate(blocos, 1):
+        got = pedir(bloco)
+        faltam = [k for k in bloco if k not in got]
+        if faltam:
+            got.update(pedir(faltam))
+            faltam = [k for k in bloco if k not in got]
+        saida.update(got)
+        if not quieto:
+            print("      %s lote %d/%d: %d/%d%s"
+                  % (destino, n, len(blocos), len(got), len(bloco),
+                     "  (%d sem tradução)" % len(faltam) if faltam else ""))
+    return saida
+
+
+def escrever_i18n(pasta, base, dicionarios, codigos):
     """Grava i18n/dicionarios.js.
 
     É .js e não .json de propósito: em file:// um fetch de .json morre em
@@ -291,8 +356,9 @@ def escrever_i18n(pasta, padrao, dicionarios, codigos):
     """
     os.makedirs(pasta, exist_ok=True)
     nomes = {c: IDIOMAS_NOME.get(c, c.upper()) for c in codigos}
-    corpo = {"padrao": padrao, "nomes": nomes,
-             "dic": {c: dicionarios.get(c, {}) for c in codigos if c != padrao}}
+    corpo = {"padrao": codigos[0], "base": base, "codigos": codigos, "nomes": nomes,
+             "dic": {c: dicionarios[c] for c in codigos
+                     if c != base and dicionarios.get(c)}}
     js = ("/* gerado pelo clonar.py — dicionários de tradução do clone.\n"
           "   Editável à mão: chave = texto original, valor = tradução. */\n"
           "window.__CLONE_I18N = " +
@@ -338,10 +404,10 @@ _I18N_JS = r"""
 (function(){
 var CFG=window.__CLONE_I18N||{dic:{},nomes:{},padrao:"__PADRAO__"};
 var DIC=CFG.dic||{}, NOMES=CFG.nomes||{}, PADRAO=CFG.padrao||"__PADRAO__";
-var CHAVE="clone-i18n", AUTO=__AUTO__;
-var codigos=Object.keys(DIC);
+var CHAVE="clone-i18n", AUTO=__AUTO__, BASE=CFG.base||PADRAO;
+/* a ordem é a que veio em --idiomas; o padrão é o primeiro */
+var codigos=(CFG.codigos&&CFG.codigos.length?CFG.codigos:Object.keys(DIC)).slice();
 if(codigos.indexOf(PADRAO)<0)codigos.unshift(PADRAO);
-codigos.sort(function(a,b){return (NOMES[a]||a).localeCompare(NOMES[b]||b);});
 
 /* ── o que dá para traduzir na tela ───────────────────────────── */
 var nos=[],orig=[],ats=[],aorig=[],tit=document.title.trim(),atual=PADRAO;
@@ -492,7 +558,7 @@ document.addEventListener("click",function(e){
       var c=el.getAttribute("data-clone-lang");
       e.preventDefault();e.stopPropagation();
       if(e.stopImmediatePropagation)e.stopImmediatePropagation();
-      if(c===PADRAO||DIC[c])aplicar(c);
+      if(DIC[c]||c===BASE)aplicar(c);
       return;
     }
     el=el.parentElement;
@@ -512,7 +578,7 @@ function iniciar(){
          for(var i=0;i<codigos.length;i++)
            if(codigos[i]===b||codigos[i].split("-")[0]===b){esc=codigos[i];break;}}
   }
-  aplicar(esc&&(DIC[esc]||esc===PADRAO)?esc:PADRAO,true);
+  aplicar(esc&&(DIC[esc]||esc===BASE)?esc:PADRAO,true);
 }
 if(document.readyState==="loading")
   document.addEventListener("DOMContentLoaded",iniciar);
@@ -842,7 +908,8 @@ def podar_css(assets):
 
 def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 marcar=False, redirect="", so_frontend=False, link="",
-                idioma="", idiomas="", idioma_pos="bl", sem_idiomas=False, idioma_auto=False):
+                idioma="", idiomas="", idioma_pos="bl", sem_idiomas=False, idioma_auto=False,
+                idioma_origem="", sem_traduzir=False):
     """Monta o clone local a partir de um dicionário de captura.
 
     Mesmo formato produzido por capturar.js (navegador) e por
@@ -1108,65 +1175,98 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
     html = relocalizar(html)
 
     # ── 3b. idiomas ───────────────────────────────────────────────
-    # Todo clone sai com seletor de idioma, tenha a página um ou não: um
-    # botão flutuante isolado em Shadow DOM, que não depende do frontend
-    # dela. As traduções vêm de duas fontes, nesta ordem:
-    #   1. a versão que o servidor de origem devolveu (capturar.js as busca);
-    #   2. i18n/<código>.json escrito à mão na pasta do clone.
-    # Sem dicionário, o idioma não entra na lista — melhor faltar opção do
-    # que oferecer uma que não traduz nada.
+    # Todo clone sai com seletor de idioma próprio: um botão flutuante
+    # isolado em Shadow DOM, que não depende do frontend da página.
+    #
+    #   --idiomas "pt-br,en,de"  -> o PRIMEIRO é o padrão, e os três ficam
+    #                               disponíveis para trocar no site.
+    #
+    # A página clonada tem o idioma que tem (o <html lang>). Todo idioma
+    # pedido que não seja esse precisa de dicionário, e ele vem, nesta ordem:
+    #   1. da versão que o servidor de origem devolveu (capturar.js as busca);
+    #   2. de i18n/<código>.json já na pasta (cache de rodadas anteriores);
+    #   3. traduzido na hora pelo CLI do Claude, e salvo como cache.
     vindos = {k.lower(): v for k, v in (d.get("idiomas") or {}).items()}
-    lang_html = (re.search(r'<html[^>]*\blang="([^"]+)"', html) or [None, ""])[1].lower()
-    padrao = (idioma or next((k for k, v in vindos.items() if v.get("atual")), "")
-              or lang_html or "pt-br").lower()
+    base_lang = (idioma_origem or
+                 (re.search(r'<html[^>]*\blang="([^"]+)"', html) or [None, ""])[1]
+                 or next((k for k, v in vindos.items() if v.get("atual")), "")
+                 or "pt-br").lower()
 
-    oferecidos = [c.strip().lower() for c in idiomas.split(",") if c.strip()] or \
-        sorted(vindos) or list(IDIOMAS_PADRAO)
+    pedidos = [c.strip().lower() for c in idiomas.split(",") if c.strip()]
+    # o primeiro da lista manda; --idioma continua valendo como atalho
+    padrao = (idioma or (pedidos[0] if pedidos else "") or base_lang).lower()
+    oferecidos = pedidos or sorted(vindos) or [base_lang]
     if padrao not in oferecidos:
         oferecidos.insert(0, padrao)
+    oferecidos = [padrao] + [c for c in oferecidos if c != padrao]
 
     pasta_i18n = os.path.join(out, "i18n")
     dicio, fonte = {}, {}
     base_para_dic = html            # antes de qualquer injeção nossa
 
-    # (1) das versões traduzidas trazidas pela captura
-    for c, v in sorted(vindos.items()):
-        if c == padrao or not v.get("html"):
-            continue
-        dic, cont = dicionario_da_variante(base_para_dic, v["html"])
-        if dic:
-            dicio[c], fonte[c] = dic, "origem"
-        else:
-            print("   idioma %s: %d vs %d segmentos — template diferente, ignorado"
-                  % (c, cont[0], cont[1]))
-
-    # (2) dicionários escritos à mão completam ou substituem
-    if os.path.isdir(pasta_i18n):
-        for fn in sorted(os.listdir(pasta_i18n)):
-            if not fn.endswith(".json") or fn.startswith("_"):
+    if not sem_idiomas:
+        # (1) versões traduzidas que vieram na captura
+        for c, v in sorted(vindos.items()):
+            if c == base_lang or c not in oferecidos or not v.get("html"):
                 continue
-            c = fn[:-5].lower()
-            try:
-                m = json.load(io.open(os.path.join(pasta_i18n, fn), encoding="utf-8"))
-            except Exception as e:
-                print("   i18n/%s ilegível: %s" % (fn, e))
-                continue
-            if isinstance(m, dict):
-                m = {k: v for k, v in m.items() if isinstance(v, str) and v.strip()}
-            if m:
-                dicio.setdefault(c, {}).update(m)
-                fonte[c] = "origem+arquivo" if fonte.get(c) == "origem" else "arquivo"
+            dic, cont = dicionario_da_variante(base_para_dic, v["html"])
+            if dic:
+                dicio[c], fonte[c] = dic, "origem"
+            else:
+                print("   idioma %s: %d vs %d segmentos — template diferente, "
+                      "vai por tradução" % (c, cont[0], cont[1]))
 
-    codigos = [padrao] + [c for c in oferecidos if c != padrao and dicio.get(c)]
-    faltando_dic = [c for c in oferecidos if c != padrao and not dicio.get(c)]
+        # (2) cache em disco
+        if os.path.isdir(pasta_i18n):
+            for fn in sorted(os.listdir(pasta_i18n)):
+                if not fn.endswith(".json") or fn.startswith("_"):
+                    continue
+                c = fn[:-5].lower()
+                try:
+                    m = json.load(io.open(os.path.join(pasta_i18n, fn), encoding="utf-8"))
+                except Exception as e:
+                    print("   i18n/%s ilegível: %s" % (fn, e))
+                    continue
+                m = {k: v for k, v in (m or {}).items()
+                     if isinstance(v, str) and v.strip()} if isinstance(m, dict) else {}
+                if m:
+                    dicio.setdefault(c, {}).update(m)
+                    fonte[c] = "origem+arquivo" if fonte.get(c) == "origem" else "arquivo"
 
     if sem_idiomas:
         html = montar(html)
     else:
-        html, n_marc = marcar_idiomas(html, set(codigos) | set(vindos))
+        html, n_marc = marcar_idiomas(html, set(oferecidos) | set(vindos))
         html = montar(html)
         os.makedirs(pasta_i18n, exist_ok=True)
-        escrever_i18n(pasta_i18n, padrao, dicio, codigos)
+
+        # (3) o que ainda falta, traduzido agora
+        base = segmentos(html)      # já limpo: sem sobra de tracker
+        termos = sorted(set(base.textos) | set(base.atributos) |
+                        ({base.titulo} if base.titulo else set()))
+        io.open(os.path.join(pasta_i18n, "_base.json"), "w", encoding="utf-8").write(
+            json.dumps({t: "" for t in termos}, ensure_ascii=False, indent=1))
+
+        pendentes = [c for c in oferecidos
+                     if c != base_lang and len(dicio.get(c, {})) < len(termos) * 0.6]
+        if pendentes and not sem_traduzir:
+            print("traduzindo %d termos de %s para: %s"
+                  % (len(termos), base_lang, ", ".join(pendentes)))
+            for c in pendentes:
+                falta = [t for t in termos if t not in dicio.get(c, {})]
+                novo_dic = traduzir_termos(falta, base_lang, c)
+                if novo_dic:
+                    dicio.setdefault(c, {}).update(novo_dic)
+                    fonte[c] = "traduzido" if fonte.get(c) is None else fonte[c] + "+traduzido"
+                    io.open(os.path.join(pasta_i18n, c + ".json"), "w",
+                            encoding="utf-8").write(json.dumps(
+                                dicio[c], ensure_ascii=False, indent=1, sort_keys=True))
+        elif pendentes:
+            print("   sem dicionário (--sem-traduzir): %s" % ", ".join(pendentes))
+
+        codigos = [c for c in oferecidos if c == base_lang or dicio.get(c)]
+        escrever_i18n(pasta_i18n, base_lang, dicio, codigos)
+
         # dicionário antes do widget, widget antes do --link: quem registra
         # o clique primeiro ganha a troca de idioma.
         snip = ('<script src="i18n/dicionarios.js"></script>\n'
@@ -1178,21 +1278,19 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             html = html.replace("</body>", snip + "\n</body>", 1)
         else:
             html += snip
-        print("idiomas: padrão %s | no seletor: %s%s"
-              % (padrao, ", ".join(codigos),
+
+        print("idiomas: página em %s | padrão %s | no seletor: %s%s"
+              % (base_lang, padrao, ", ".join(codigos),
                  " | %d opções nativas religadas" % n_marc if n_marc else ""))
         for c in codigos:
-            if c != padrao:
-                print("   %-9s %4d termos (%s)" % (c, len(dicio[c]), fonte.get(c, "?")))
-        if faltando_dic:
-            base = segmentos(html)      # já limpo: sem sobra de tracker
-            termos = sorted(set(base.textos) | set(base.atributos) |
-                            ({base.titulo} if base.titulo else set()))
-            io.open(os.path.join(pasta_i18n, "_base.json"), "w", encoding="utf-8").write(
-                json.dumps({t: "" for t in termos}, ensure_ascii=False, indent=1))
-            print("   sem dicionário: %s" % ", ".join(faltando_dic))
-            print("   -> %d termos em i18n/_base.json; preencha e salve como "
-                  "i18n/<código>.json, depois rode de novo" % len(termos))
+            if c == base_lang:
+                print("   %-9s %4d termos (texto original da página)" % (c, len(termos)))
+            else:
+                print("   %-9s %4d/%d termos (%s)"
+                      % (c, len(dicio[c]), len(termos), fonte.get(c, "?")))
+        fora = [c for c in oferecidos if c not in codigos]
+        if fora:
+            print("   FORA do seletor (sem dicionário): %s" % ", ".join(fora))
 
     io.open(os.path.join(out, "index.html"), "w",
             encoding="utf-8", errors="surrogatepass").write(html)
@@ -1330,10 +1428,17 @@ def main():
     ap.add_argument("--link", default="", metavar="URL",
                     help="troca o href de todos os <a> por esta URL (só os <a>)")
     ap.add_argument("--idioma", default="", metavar="COD",
-                    help="idioma padrão do clone (ex.: pt-br). Padrão: o <html lang> da página")
+                    help="atalho: força o idioma padrão. Normalmente basta pôr ele "
+                         "em primeiro na lista de --idiomas")
     ap.add_argument("--idiomas", default="", metavar="LISTA",
-                    help="idiomas oferecidos no seletor, separados por vírgula. "
-                         "Padrão: os que a página já oferece, ou " + ",".join(IDIOMAS_PADRAO))
+                    help="idiomas disponíveis no seletor, separados por vírgula. "
+                         "O PRIMEIRO é o padrão do clone. Ex.: pt-br,en,de")
+    ap.add_argument("--idioma-origem", default="", metavar="COD",
+                    help="idioma em que a página capturada está "
+                         "(padrão: o <html lang> dela)")
+    ap.add_argument("--sem-traduzir", action="store_true",
+                    help="não chama o Claude para traduzir o que faltar; usa só "
+                         "o que veio da captura e os i18n/<cod>.json existentes")
     ap.add_argument("--idioma-pos", default="bl", choices=sorted(CANTOS),
                     help="canto do botão flutuante: bl/br/tl/tr (padrão bl)")
     ap.add_argument("--idioma-auto", action="store_true",
@@ -1359,7 +1464,8 @@ def main():
                 bloquear=a.bloquear, marcar=a.marcar, redirect=a.redirect,
                 so_frontend=a.so_frontend, link=a.link,
                 idioma=a.idioma, idiomas=a.idiomas, idioma_pos=a.idioma_pos,
-                sem_idiomas=a.sem_idiomas, idioma_auto=a.idioma_auto)
+                sem_idiomas=a.sem_idiomas, idioma_auto=a.idioma_auto,
+                idioma_origem=a.idioma_origem, sem_traduzir=a.sem_traduzir)
 
 
 if __name__ == "__main__":
