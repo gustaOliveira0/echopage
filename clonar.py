@@ -42,6 +42,35 @@ def baixar_url(url, referer=None, timeout=25):
                 dados = zlib.decompress(dados, -zlib.MAX_WBITS)
         return dados, r.headers.get("Content-Type", "")
 
+# Domínios/redes que são rastreamento sem ambiguidade nenhuma. Ganham de
+# tudo: nem a whitelist de UI salva um script servido por um destes.
+TRACKER_DOMINIOS = [
+    "chrome-extension://", "moz-extension://",
+    "googletagmanager", "google-analytics", "analytics.google", "doubleclick",
+    "clarity.ms", "posthog", "cloudflareinsights", "connect.facebook",
+    "facebook.net", "facebook.com/tr", "hotjar", "segment.io", "segment.com",
+    "mixpanel", "amplitude", "tiktok", "bat.bing.com", "criteo", "taboola",
+    "outbrain", "newrelic", "sentry.io", "datadoghq", "snapchat", "sc-static",
+    "pinterest", "reddit.com/rp", "linkedin.com/px", "licdn.com",
+    # redes de afiliado/CPA: pixel de conversão, postback e cloaking
+    "maxweb", "everflow", "voluum", "redtrack", "binom", "clickmagick",
+    "cloaker", "trackier", "affise", "hasoffers", "cake-affiliate",
+]
+
+# Frontend puro. Um arquivo com um destes no nome MANTÉM, mesmo que case com
+# algum padrão frouxo da TRACKER_SRC ("/track.js" x "slick-track.js", por
+# exemplo). É o lado seguro do CLAUDE.md: remover UI quebra a página.
+UI_KEEP = [
+    "language", "lang.selector", "i18n", "locale", "translat",
+    "slider", "swiper", "splide", "owl", "slick", "glide", "flickity",
+    "carousel", "accordion", "collapse", "countdown", "timer", "counter",
+    "animate", "animation", "wow.min", "aos.", "scrollreveal", "gsap",
+    "lightbox", "fancybox", "magnific", "modal", "popper", "tooltip",
+    "jquery", "bootstrap", "popup", "mask", "inputmask", "validate",
+    "flatpickr", "datepicker", "lazyload", "lazysizes", "smooth-scroll",
+    "menu", "navbar", "hamburger", "tabs.", "select2", "choices",
+]
+
 # Scripts que NÃO devem rodar no clone (rastreamento / lixo de extensão).
 TRACKER_SRC = [
     "chrome-extension://", "moz-extension://", "googletagmanager", "google-analytics",
@@ -59,6 +88,8 @@ TRACKER_SRC = [
     # redes de tracking de afiliado/CPA e verificação de tráfego (cloaking)
     "mxj5trk", "trackjs", "/track.js", "voluum", "redtrack", "binom",
     "clickmagick", "everflow", "cloaker",
+    "/conversion/iframe", "/conversion/pixel", "/postback", "/pixel.gif",
+    "/collect?", "/beacon", "/impression",
     # PostHog atrás de proxy próprio: a chave de projeto começa sempre por
     # "phc_" e o SDK carrega de /array/<chave>/ — pega o config.js disfarçado.
     "phc_", "/array/phc",
@@ -193,7 +224,13 @@ MIME_EXT = {
 
 
 def eh_tracker(url):
-    return any(t in url for t in TRACKER_SRC)
+    """Decide pela URL de ORIGEM, na ordem: domínio de tracking > UI > padrão."""
+    u = url.lower()
+    if any(t in u for t in TRACKER_DOMINIOS):
+        return True
+    if any(t in u for t in UI_KEEP):
+        return False
+    return any(t in u for t in TRACKER_SRC)
 
 
 def nome_local(url, meta, usados):
@@ -533,9 +570,15 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             porque = None
             if src:
                 alvo = src.group(1)
-                origem = local2url.get(alvo.split("?")[0], "")
-                for t in TRACKER_SRC:
-                    if t in alvo or (origem and t in origem): porque = t; break
+                # o src pode ter virado "assets/xxx.js" e escondido o domínio:
+                # a decisão olha a URL de ORIGEM.
+                origem = local2url.get(alvo.split("?")[0], "") or alvo
+                u = (origem + " " + alvo).lower()
+                for t in TRACKER_DOMINIOS:
+                    if t in u: porque = t; break
+                if not porque and not any(k in u for k in UI_KEEP):
+                    for t in TRACKER_SRC:
+                        if t in u: porque = t; break
             else:
                 for t in TRACKER_INLINE:
                     if t in corpo: porque = t; break
@@ -546,10 +589,6 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                     % (porque, attrs, corpo))
 
         html = re.sub(r"<script\b([^>]*)>(.*?)</script>", mata, html, flags=re.S)
-        html, n_ifr = re.subn(
-            r'<iframe([^>]*)src="(?:[^"]*saved_resource[^"]*|https?://[^"]*(?:%s)[^"]*)"([^>]*)>'
-            % "|".join(map(re.escape, ["googletagmanager", "cdn-cgi", "doubleclick", "facebook"])),
-            r'<iframe\1data-clone-disabled="tracker-iframe"\2>', html)
         html, n_ns = re.subn(r"<noscript><iframe[^>]*(?:googletagmanager|facebook)[^>]*>.*?</noscript>",
                              "<!-- tracker noscript removido -->", html, flags=re.S)
 
@@ -557,18 +596,37 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         # deixaria a tag apontando para o rastreador e ela dispararia igual.
         px = [0]
 
+        def minusculo(attrs):
+            """1x1 invisível não é interface — é beacon, venha de onde vier."""
+            def dim(nome):
+                m = re.search(r'\b%s="(\d+)' % nome, attrs) or \
+                    re.search(r'%s\s*:\s*(\d+)\s*px' % nome, attrs)
+                return int(m.group(1)) if m else None
+            l, a = dim("width"), dim("height")
+            return l is not None and a is not None and l <= 2 and a <= 2
+
         def mata_pixel(m):
             tag, attrs = m.group(1), m.group(2)
             src = re.search(r'src="([^"]*)"', attrs)
-            if not src or not eh_tracker(src.group(1)):
+            # o src já virou "assets/xxx": a decisão olha a URL de ORIGEM.
+            alvo_src = src.group(1) if src else ""
+            origem = local2url.get(alvo_src.split("?")[0], alvo_src)
+            porque = None
+            if src and (eh_tracker(origem) or "saved_resource" in alvo_src):
+                porque = "pixel"
+            elif tag == "iframe" and minusculo(attrs):
+                porque = "iframe-1x1"          # inclusive sem src / about:blank
+            elif tag == "img" and src and minusculo(attrs) and eh_tracker(origem):
+                porque = "pixel-1x1"
+            if not porque:
                 return m.group(0)
             limpo = re.sub(r'\ssrc="[^"]*"', "", attrs)
             px[0] += 1
-            return '<%s%s data-clone-disabled="pixel">' % (tag, limpo)
+            return '<%s%s data-clone-disabled="%s">' % (tag, limpo, porque)
 
         html = re.sub(r"<(img|iframe)([^>]*)>", mata_pixel, html)
-        print("rastreadores encontrados: %d scripts, %d iframes, %d pixels"
-              % (len(mortos), n_ifr + n_ns, px[0]))
+        print("rastreadores encontrados: %d scripts, %d noscript, %d pixels/iframes"
+              % (len(mortos), n_ns, px[0]))
 
         if not a.marcar:
             # LIMPEZA TOTAL: tira o que foi marcado em vez de só desativar,
@@ -576,11 +634,18 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             c = {}
             html, c["scripts"] = re.subn(
                 r"<script\b[^>]*data-clone-disabled[^>]*>.*?</script>\s*", "", html, flags=re.S)
+            html, c["iframes"] = re.subn(
+                r"<iframe\b[^>]*data-clone-disabled[^>]*>.*?</iframe>\s*", "", html, flags=re.S)
             html, c["pixels"] = re.subn(
-                r"<(?:img|iframe)\b[^>]*data-clone-disabled[^>]*>\s*", "", html)
+                r"<(?:img|iframe)\b[^>]*data-clone-disabled[^>]*>\s*(?:</iframe>\s*)?", "", html)
             html, c["noscript"] = re.subn(
                 r"<noscript>\s*(?:<!--[^>]*-->)?\s*</noscript>\s*", "", html)
-            # preconnect/dns-prefetch/preload para fora: só abrem conexão
+            # preconnect/dns-prefetch: só abrem conexão, nunca renderizam nada
+            html, c["hints"] = re.subn(
+                r'<link\b[^>]*rel="(?:preconnect|dns-prefetch)"[^>]*>\s*', "", html)
+            html, c["hints2"] = re.subn(
+                r'<link\b(?=[^>]*rel="(?:preconnect|dns-prefetch)")[^>]*>\s*', "", html)
+            # preload/prefetch que ainda apontam para fora
             html, c["prefetch"] = re.subn(
                 r'<link\b[^>]*rel="(?:preconnect|dns-prefetch|prefetch|preload)"[^>]*href="https?://[^"]*"[^>]*>\s*',
                 "", html)

@@ -28,10 +28,22 @@ alvo = os.path.join(CLONES, nome)
 if not os.path.isdir(alvo):
     sys.exit("ERRO: clone '%s' não existe. Disponíveis: %s" % (nome, ", ".join(disponiveis) or "nenhum"))
 
+class Handler(http.server.SimpleHTTPRequestHandler):
+    """Arquivo sem extensão conhecida vira text/plain, nunca octet-stream.
+
+    O padrão application/octet-stream faz o Chrome BAIXAR o arquivo em vez de
+    ignorá-lo — foi o que acontecia com um resto de pixel de conversão salvo
+    como "assets/xxx_index" dentro de um <iframe>.
+    """
+    def guess_type(self, path):
+        t = super().guess_type(path)
+        return "text/plain" if t in (None, "application/octet-stream") else t
+
+
 os.chdir(alvo)
 socketserver.TCPServer.allow_reuse_address = True
 url = "http://localhost:%d/" % porta
-with socketserver.TCPServer(("127.0.0.1", porta), http.server.SimpleHTTPRequestHandler) as s:
+with socketserver.TCPServer(("127.0.0.1", porta), Handler) as s:
     print("servindo '%s' em %s   (Ctrl+C para parar)" % (nome, url), flush=True)
     try:
         webbrowser.open(url)
