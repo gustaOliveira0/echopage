@@ -299,6 +299,62 @@ def dicionario_da_variante(html_base, html_var):
     return d, (len(b.textos), len(v.textos))
 
 
+def normaliza_codigo(c):
+    """pt_BR, PT-br, "pt-BR " -> pt-br. Devolve "" se não for BCP-47."""
+    c = (c or "").strip().replace("_", "-").lower()
+    c = re.split(r"[,;\s]", c)[0]
+    return c if valida_codigo(c) else ""
+
+
+def idioma_da_pagina(html, amostra=None):
+    """Descobre em que idioma a página está — pela própria página.
+
+    Ordem: o que o HTML declara (lang do <html>, xml:lang, meta de idioma)
+    e, se ele não declarar nada, o texto que ele contém. Nunca um padrão
+    chutado: dizer "é português" para uma página em inglês faria o clonador
+    traduzir de um idioma para ele mesmo.
+    """
+    padroes = [
+        r"<html\b[^>]*\blang\s*=\s*[\"']([^\"']+)",
+        r"<html\b[^>]*\bxml:lang\s*=\s*[\"']([^\"']+)",
+        r"<html\b[^>]*\blang\s*=\s*([A-Za-z][\w-]*)",
+        r"<meta\b[^>]*http-equiv\s*=\s*[\"']content-language[\"'][^>]*content\s*=\s*[\"']([^\"']+)",
+        r"<meta\b[^>]*content\s*=\s*[\"']([^\"']+)[\"'][^>]*http-equiv\s*=\s*[\"']content-language",
+        r"<meta\b[^>]*name\s*=\s*[\"']language[\"'][^>]*content\s*=\s*[\"']([^\"']+)",
+        r"<meta\b[^>]*property\s*=\s*[\"']og:locale[\"'][^>]*content\s*=\s*[\"']([^\"']+)",
+    ]
+    for pat in padroes:
+        m = re.search(pat, html, re.I)
+        if m:
+            c = normaliza_codigo(m.group(1))
+            if c:
+                return c, "declarado no HTML"
+    if amostra:
+        c = detectar_idioma(amostra)
+        if c:
+            return c, "detectado pelo texto da página"
+    return "", "não declarado"
+
+
+def detectar_idioma(termos):
+    """Último recurso: pergunta ao Claude em que idioma o texto está."""
+    import subprocess
+    trecho = [t for t in termos if len(t) > 25][:12] or list(termos)[:12]
+    if not trecho:
+        return ""
+    try:
+        r = subprocess.run(
+            ["claude", "-p",
+             "Em que idioma está este texto? Responda SÓ o código BCP-47 "
+             "(ex.: en, pt-br, de, zh-hans), nada mais.\n\n"
+             + "\n".join(trecho)],
+            capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+    except Exception:
+        return ""
+    return normaliza_codigo((r.stdout or "").strip().splitlines()[0]
+                            if (r.stdout or "").strip() else "")
+
+
 def traduzir_termos(termos, origem, destino, lote=40, quieto=False):
     """Traduz uma lista de termos chamando o CLI do Claude (`claude -p`).
 
@@ -1225,10 +1281,23 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
     #   2. de i18n/<código>.json já na pasta (cache de rodadas anteriores);
     #   3. traduzido na hora pelo CLI do Claude, e salvo como cache.
     vindos = {k.lower(): v for k, v in (d.get("idiomas") or {}).items()}
-    base_lang = (idioma_origem or
-                 (re.search(r'<html[^>]*\blang="([^"]+)"', html) or [None, ""])[1]
-                 or next((k for k, v in vindos.items() if v.get("atual")), "")
-                 or "pt-br").lower()
+    # O idioma da página vem SEMPRE da própria página: é o que o HTML
+    # declara. --idioma-origem existe só para o caso raro de o site declarar
+    # errado (acontece: template em inglês com lang="pt-br" esquecido).
+    if idioma_origem:
+        base_lang = normaliza_codigo(idioma_origem)
+        if not base_lang:
+            sys.exit("ERRO: --idioma-origem inválido: %s" % idioma_origem)
+        origem_de = "informado no comando"
+    else:
+        base_lang, origem_de = idioma_da_pagina(html)
+        if not base_lang:
+            # o HTML não declarou: pergunta ao texto dele, não a um chute
+            base_lang, origem_de = idioma_da_pagina(
+                html, amostra=sorted(set(segmentos(html).textos)))
+        if not base_lang:
+            sys.exit("ERRO: a página não declara idioma e não deu para "
+                     "detectar.\n      Passe --idioma-origem <sigla>.")
 
     pedidos = [c.strip().lower().replace("_", "-") for c in idiomas.split(",") if c.strip()]
     ruins = [c for c in pedidos if not valida_codigo(c)]
@@ -1323,8 +1392,8 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         else:
             html += snip
 
-        print("idiomas: página em %s | padrão %s | no seletor: %s%s"
-              % (base_lang, padrao, ", ".join(codigos),
+        print("idiomas: página em %s (%s) | padrão %s | no seletor: %s%s"
+              % (base_lang, origem_de, padrao, ", ".join(codigos),
                  " | %d opções nativas religadas" % n_marc if n_marc else ""))
         for c in codigos:
             if c == base_lang:

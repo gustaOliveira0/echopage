@@ -37,9 +37,17 @@ links `<a>` para uma URL fornecida.
    dicionário: sem recarregar, sem query string, sem servidor, sem chamada
    externa. A escolha do visitante fica no `localStorage`.
 
-   A página clonada está no idioma que está (o `<html lang>`, ou
-   `--idioma-origem`). Todo idioma pedido que não seja esse ganha dicionário,
-   nesta ordem de fonte:
+   **O idioma de origem vem sempre da própria página**, nesta ordem: `lang`
+   do `<html>`, `xml:lang`, `<meta http-equiv="content-language">`,
+   `<meta name="language">`, `og:locale` — aceitando aspas simples, duplas ou
+   nenhuma, e normalizando (`pt_BR` → `pt-br`). Se o HTML não declarar nada,
+   o idioma é detectado a partir do texto que ele contém. Nunca um padrão
+   chutado: dizer "é português" para uma página em inglês faria o clonador
+   traduzir de um idioma para ele mesmo. `--idioma-origem` existe só para o
+   caso raro de o site declarar errado.
+
+   Todo idioma pedido que não seja o da página ganha dicionário, nesta ordem
+   de fonte:
 
    a. **A versão que o site de origem devolveu.** Muitas dessas páginas
       traduzem no servidor (`?lang=en`), e isso não vem no HTML baixado. O
