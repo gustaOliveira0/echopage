@@ -54,6 +54,12 @@ links `<a>` para uma URL fornecida.
       resultado é salvo como `i18n/<código>.json`, então só se paga uma vez.
       `--sem-traduzir` desliga.
 
+   **Qualquer sigla BCP-47 serve** — `sw`, `vi`, `ar`, `sr-latn`. Não há
+   lista fechada: o nome no menu sai do `Intl.DisplayNames` do navegador, no
+   próprio idioma ("Kiswahili", "العربية", "日本語"), e idioma de escrita da
+   direita para a esquerda (ar, he, fa, ur…) ganha `dir="rtl"` no `<html>`.
+   Sigla malformada para o comando antes de gastar tradução.
+
    Uma landing típica dá ~150 termos: ~2 min por idioma. Rótulo de idioma
    ("English", "日本語") não entra — cada um já está no próprio idioma.
 

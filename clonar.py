@@ -188,6 +188,22 @@ IDIOMAS_NOME = {
     "zh": "中文",
 }
 IDIOMAS_PADRAO = ["en", "es", "pt-br", "fr", "de", "it", "ja", "zh-hans"]
+
+# A tabela acima é só um atalho de nomes. O clone aceita QUALQUER sigla
+# BCP-47 — "sw", "vi", "af-za", "sr-latn" — e o nome no menu sai do
+# Intl.DisplayNames do navegador, no próprio idioma.
+CODIGO_RE = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8}){0,2}$")
+
+# Escrita da direita para a esquerda: sem isto o texto entra invertido.
+RTL = {"ar", "he", "fa", "ur", "ps", "sd", "ug", "yi", "dv", "ku", "ckb", "arc"}
+
+
+def valida_codigo(c):
+    return bool(CODIGO_RE.match(c))
+
+
+def eh_rtl(c):
+    return c.split("-")[0] in RTL
 IGNORA_TEXTO = {"script", "style", "noscript", "template", "svg", "code", "pre"}
 ATRIB_TEXTO = ("alt", "title", "placeholder", "aria-label")
 
@@ -294,8 +310,8 @@ def traduzir_termos(termos, origem, destino, lote=40, quieto=False):
     import subprocess
     if not termos:
         return {}
-    alvo_nome = IDIOMAS_NOME.get(destino, destino)
-    orig_nome = IDIOMAS_NOME.get(origem, origem)
+    alvo_nome = IDIOMAS_NOME.get(destino) or "código BCP-47 %s" % destino
+    orig_nome = IDIOMAS_NOME.get(origem) or "código BCP-47 %s" % origem
     saida = {}
 
     def pedir(chaves):
@@ -312,7 +328,9 @@ def traduzir_termos(termos, origem, destino, lote=40, quieto=False):
             "muitas frases são pedaços de uma sentença maior.\n"
             "- Mantenha o tom comercial e o comprimento parecido — o texto entra "
             "num layout pronto.\n"
-            "- Se um valor não fizer sentido traduzir, repita o original.\n\n"
+            "- Se um valor não fizer sentido traduzir, repita o original.\n"
+            "- Escreva na escrita nativa do idioma de destino, não em "
+            "transliteração.\n\n"
             "%s" % (origem, orig_nome, destino, alvo_nome, pedido))
         try:
             r = subprocess.run(["claude", "-p", prompt], capture_output=True,
@@ -357,6 +375,7 @@ def escrever_i18n(pasta, base, dicionarios, codigos):
     os.makedirs(pasta, exist_ok=True)
     nomes = {c: IDIOMAS_NOME.get(c, c.upper()) for c in codigos}
     corpo = {"padrao": codigos[0], "base": base, "codigos": codigos, "nomes": nomes,
+             "rtl": sorted(c for c in codigos if eh_rtl(c)),
              "dic": {c: dicionarios[c] for c in codigos
                      if c != base and dicionarios.get(c)}}
     js = ("/* gerado pelo clonar.py — dicionários de tradução do clone.\n"
@@ -405,6 +424,7 @@ _I18N_JS = r"""
 var CFG=window.__CLONE_I18N||{dic:{},nomes:{},padrao:"__PADRAO__"};
 var DIC=CFG.dic||{}, NOMES=CFG.nomes||{}, PADRAO=CFG.padrao||"__PADRAO__";
 var CHAVE="clone-i18n", AUTO=__AUTO__, BASE=CFG.base||PADRAO;
+var RTL=CFG.rtl||[], DIR0=document.documentElement.getAttribute("dir")||"";
 /* a ordem é a que veio em --idiomas; o padrão é o primeiro */
 var codigos=(CFG.codigos&&CFG.codigos.length?CFG.codigos:Object.keys(DIC)).slice();
 if(codigos.indexOf(PADRAO)<0)codigos.unshift(PADRAO);
@@ -452,6 +472,11 @@ function aplicar(cod,silencioso){
   }
   document.title=(d&&d[tit])||tit;
   document.documentElement.setAttribute("lang",cod);
+  /* árabe, hebraico, persa e afins: sem dir=rtl o texto entra invertido */
+  if(RTL.indexOf(cod.split("-")[0])>=0)
+    document.documentElement.setAttribute("dir","rtl");
+  else if(DIR0)document.documentElement.setAttribute("dir",DIR0);
+  else document.documentElement.removeAttribute("dir");
   atual=cod;
   if(!silencioso){try{localStorage.setItem(CHAVE,cod);}catch(_){}}
   /* o seletor nativo da página, se existir, acompanha a escolha */
@@ -461,7 +486,7 @@ function aplicar(cod,silencioso){
     if(op[i].classList)op[i].classList[c===cod?"add":"remove"]("active");
   }
   var dl=document.querySelector(".default-lang,.current-lang,[data-lang-atual]");
-  if(dl&&!nosso(dl))dl.textContent=NOMES[cod]||cod;
+  if(dl&&!nosso(dl))dl.textContent=nome(cod);
   pintar();
 }
 
@@ -509,9 +534,22 @@ var GLOBO='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="c
  'stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18'+
  'a15 15 0 0 1 0-18"/></svg>';
 
+/* O nome de cada idioma sai do próprio navegador (Intl.DisplayNames), no
+   idioma dele: "Deutsch", "Kiswahili", "العربية". Assim qualquer sigla
+   BCP-47 funciona sem tabela nenhuma. NOMES só entra como reserva. */
+var nomeCache={};
+function nome(c){
+  if(nomeCache[c])return nomeCache[c];
+  var n="";
+  try{ n=new Intl.DisplayNames([c],{type:"language"}).of(c)||""; }catch(_){}
+  if(!n||n.toLowerCase()===c.toLowerCase())n=NOMES[c]||"";
+  if(!n)n=c.toUpperCase();
+  if(n&&n[0]&&n[0].toLowerCase()===n[0])n=n[0].toLocaleUpperCase(c)+n.slice(1);
+  return (nomeCache[c]=n);
+}
 function pintar(){
   if(!sh)return;
-  sh.querySelector(".cod").textContent=NOMES[atual]||atual.toUpperCase();
+  sh.querySelector(".cod").textContent=nome(atual);
   sh.querySelector(".cur").textContent=atual.split("-")[0].toUpperCase();
   var its=sh.querySelectorAll(".it");
   for(var i=0;i<its.length;i++)
@@ -531,8 +569,8 @@ function montar(){
   sh=host.attachShadow({mode:"open"});
   var itens="";
   for(var i=0;i<codigos.length;i++)
-    itens+='<button class="it" role="option" data-cod="'+codigos[i]+'">'+
-           '<span>'+(NOMES[codigos[i]]||codigos[i])+'</span><span class="tick">✓</span></button>';
+    itens+='<button class="it" role="option" data-cod="'+codigos[i]+'" lang="'+codigos[i]+'">'+
+           '<span>'+nome(codigos[i])+'</span><span class="tick">✓</span></button>';
   sh.innerHTML=ESTILO+
     '<button class="pill" aria-haspopup="listbox" aria-expanded="false" aria-label="Idioma">'+
     GLOBO+'<span class="cod"></span><span class="cur"></span><span class="ch">▾</span></button>'+
@@ -1192,7 +1230,13 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                  or next((k for k, v in vindos.items() if v.get("atual")), "")
                  or "pt-br").lower()
 
-    pedidos = [c.strip().lower() for c in idiomas.split(",") if c.strip()]
+    pedidos = [c.strip().lower().replace("_", "-") for c in idiomas.split(",") if c.strip()]
+    ruins = [c for c in pedidos if not valida_codigo(c)]
+    if ruins:
+        sys.exit("ERRO: sigla de idioma inválida: %s\n"
+                 "      Use código BCP-47: pt-br, en, de, ja, zh-hans, ar, sw…"
+                 % ", ".join(ruins))
+    pedidos = list(dict.fromkeys(pedidos))       # sem repetir, ordem mantida
     # o primeiro da lista manda; --idioma continua valendo como atalho
     padrao = (idioma or (pedidos[0] if pedidos else "") or base_lang).lower()
     oferecidos = pedidos or sorted(vindos) or [base_lang]
