@@ -23,6 +23,25 @@ links `<a>` para uma URL fornecida.
    Atenção: o `src` do tracker pode ter sido reescrito para `assets/xxx.js`,
    escondendo o domínio; a decisão olha a **URL de origem**, não o nome local.
 
+   **O que as listas não decidem, a LLM decide.** As listas cobrem o que já se
+   conhece; um rastreador novo, ou servido de um domínio próprio, não casa com
+   nada e passaria direto. Todo script que sobra sem veredicto vai numa única
+   chamada `claude -p`, classificado em `interface` / `rastreamento` / `misto`,
+   com a regra de ouro no prompt: **na dúvida, interface**. O veredicto é
+   gravado por hash do conteúdo em `.veredictos.json`, então cada script é
+   julgado uma vez só, para sempre, em qualquer clone — a segunda rodada não
+   chama a LLM. `--sem-triagem` desliga.
+
+   Foi assim que saiu o `b04jdmd.com/scripts/main.js` da Vanotium: nome
+   genérico, domínio anônimo, nenhuma lista pegava — e são 202 chamadas a
+   `EF.`, com `offer_id`, `transaction_id` e `fingerprint`.
+
+   **Global órfão vira stub.** Tirar o SDK e deixar o JS de interface chamando
+   `EF.click()` dá `ReferenceError`, e o erro derruba o resto do arquivo — a
+   página perde justamente a UI que a limpeza queria proteger. Todo global que
+   o JS mantido chama, não define, e que o JS removido definia, ganha um objeto
+   inerte com os métodos certos.
+
 3. **Todo clone sai traduzido nos idiomas pedidos.** No comando entram os
    idiomas; o **primeiro é o padrão** e todos ficam disponíveis para trocar
    no site:

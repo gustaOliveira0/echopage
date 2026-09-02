@@ -355,6 +355,212 @@ def detectar_idioma(termos):
                             if (r.stdout or "").strip() else "")
 
 
+CACHE_TRIAGEM = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             ".veredictos.json")
+
+
+def _amostra_script(texto, limite=2600):
+    """Pedaço do script que revela a intenção sem estourar o pedido.
+
+    O começo é onde ficam a config e as chaves de projeto; o resto é
+    minificação. Um trecho do meio ajuda a pegar o envio de dados.
+    """
+    texto = texto or ""
+    if len(texto) <= limite:
+        return texto
+    meio = len(texto) // 2
+    return (texto[:limite * 2 // 3] + "\n…\n"
+            + texto[meio:meio + limite // 3])
+
+
+def triagem_scripts(indecisos, quieto=False):
+    """O que as regras não decidem, a LLM decide: interface ou rastreamento?
+
+    As listas cobrem o que já se conhece. Um rastreador novo, ou servido de
+    um domínio próprio, não casa com nada e hoje passa direto — o lado
+    seguro do CLAUDE.md manda manter, e manter é o certo quando ninguém
+    olhou. Aqui alguém olha.
+
+    O veredicto é gravado por hash do conteúdo em .veredictos.json, então
+    cada script é julgado uma vez só, para sempre, em qualquer clone.
+    """
+    import subprocess
+    if not indecisos:
+        return {}
+    cache = {}
+    if os.path.exists(CACHE_TRIAGEM):
+        try:
+            cache = json.load(io.open(CACHE_TRIAGEM, encoding="utf-8"))
+        except Exception:
+            cache = {}
+
+    veredicto, novos = {}, []
+    for it in indecisos:
+        h = hashlib.sha1((it["origem"] + "\x00" + it["texto"]).encode(
+            "utf-8", "replace")).hexdigest()
+        it["hash"] = h
+        if h in cache:
+            veredicto[it["id"]] = cache[h]
+        else:
+            novos.append(it)
+
+    if novos:
+        linhas = []
+        for n, it in enumerate(novos, 1):
+            linhas.append("### %d\nURL de origem: %s\nTrecho:\n%s"
+                          % (n, it["origem"] or "(script inline na página)",
+                             _amostra_script(it["texto"])))
+        prompt = (
+            "Você tria scripts de uma landing page que está sendo clonada para "
+            "rodar em localhost, sem rastreamento.\n\n"
+            "Para CADA script abaixo, classifique:\n"
+            '- "interface": manipula a página — FAQ, slider, cronômetro, menu, '
+            "animação, máscara, validação, seletor de idioma, lazy-load, "
+            "vídeo, biblioteca de UI (jQuery, bootstrap, swiper…).\n"
+            '- "rastreamento": manda dados de navegação para terceiros — '
+            "analytics, pixel, session replay, heatmap, A/B testing, "
+            "postback de afiliado, fingerprinting, detecção de bot.\n"
+            '- "misto": faz as duas coisas.\n\n'
+            "REGRA DE OURO: na dúvida, responda \"interface\". Remover um "
+            "script de UI quebra a página; manter um rastreador num clone "
+            "local é inofensivo. Só responda \"rastreamento\" se o script "
+            "existir PARA rastrear.\n\n"
+            "Responda SÓ um objeto JSON: chave = o número do script, valor = "
+            '{"classe": "...", "porque": "<até 8 palavras>"}\n\n'
+            + "\n\n".join(linhas))
+        try:
+            r = subprocess.run(["claude", "-p", prompt], capture_output=True,
+                               text=True, timeout=600, stdin=subprocess.DEVNULL)
+            txt = (r.stdout or "").strip()
+            if "```" in txt:
+                txt = re.sub(r"^.*?```(?:json)?\s*|\s*```.*$", "", txt, flags=re.S)
+            i, f = txt.find("{"), txt.rfind("}")
+            m = json.loads(txt[i:f + 1]) if i >= 0 and f > i else {}
+        except Exception as e:
+            if not quieto:
+                print("   triagem indisponível (%s) — tudo mantido" % e)
+            m = {}
+        for n, it in enumerate(novos, 1):
+            v = m.get(str(n)) or m.get(n) or {}
+            classe = (v.get("classe") or "").strip().lower()
+            if classe not in ("interface", "rastreamento", "misto"):
+                classe = "interface"          # sem resposta clara: mantém
+            reg = {"classe": classe, "porque": (v.get("porque") or "")[:60]}
+            cache[it["hash"]] = reg
+            veredicto[it["id"]] = reg
+        try:
+            io.open(CACHE_TRIAGEM, "w", encoding="utf-8").write(
+                json.dumps(cache, ensure_ascii=False, indent=1, sort_keys=True))
+        except Exception:
+            pass
+    return veredicto
+
+
+# Globais que o navegador já tem — nunca viram stub.
+NATIVOS = set("""
+Math JSON Object Array String Number Boolean Date Promise Intl RegExp Error
+Map Set WeakMap WeakSet Symbol Reflect Proxy BigInt Function console window
+document navigator location history screen localStorage sessionStorage
+performance URL URLSearchParams FormData Headers Request Response Blob File
+FileReader XMLHttpRequest AbortController Element Node HTMLElement Event
+CustomEvent MutationObserver IntersectionObserver ResizeObserver Image Audio
+Video Worker Notification CSS NodeList DOMParser TextEncoder TextDecoder
+ArrayBuffer Uint8Array Int8Array Float32Array DataView Atomics WebAssembly
+""".split())
+
+_DEF_RE = (r"(?:window\.%s\s*=|\bvar\s+%s\s*=|\blet\s+%s\s*=|\bconst\s+%s\s*=|"
+           r"\bfunction\s+%s\b|\b%s\s*=\s*(?:function|\{|\[))")
+
+
+def _define(js, nome):
+    n = re.escape(nome)
+    return re.search(_DEF_RE % (n, n, n, n, n, n), js) is not None
+
+
+def stubs_orfaos(js_fica, js_saiu):
+    """Stubs para os globais que saíram junto com um script removido.
+
+    Tirar o SDK de rastreamento e deixar o JS de interface chamando
+    `EF.click()` dá ReferenceError, e o erro derruba o resto do arquivo — a
+    página perde justamente a UI que a limpeza queria proteger. Aqui, todo
+    global que o JS que FICOU chama, que ele não define, e que o JS REMOVIDO
+    definia, ganha um objeto inerte com os métodos certos.
+    """
+    usados = {}
+    for m in re.finditer(r"(?<![\w.$])([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(",
+                         js_fica):
+        nome, metodo = m.group(1), m.group(2)
+        if nome in NATIVOS or len(nome) < 2:
+            continue
+        usados.setdefault(nome, set()).add(metodo)
+
+    orfaos = {n: ms for n, ms in usados.items()
+              if not _define(js_fica, n) and _define(js_saiu, n)}
+    if not orfaos:
+        return "", {}
+    partes = []
+    for n in sorted(orfaos):
+        corpo = ",".join('%s:function(){return "";}' % m for m in sorted(orfaos[n]))
+        partes.append("window.%s=window.%s||{%s};" % (n, n, corpo))
+    return ('<script data-clone="stubs-orfaos">\n'
+            '/* globais que saíram com os rastreadores; sem eles o JS de '
+            'interface quebraria */\n' + "\n".join(partes) + "\n</script>"), orfaos
+
+
+def regra_script(attrs, corpo, local2url):
+    """Decide um <script> pelas listas. Devolve (porque, chave, origem).
+
+    porque=None significa "as regras não sabem" — é o que vai para a triagem.
+    Uma função só para não haver duas versões da regra andando separadas.
+    """
+    src = re.search(r'src="([^"]*)"', attrs)
+    if src:
+        alvo = src.group(1)
+        # o src pode ter virado "assets/xxx.js" e escondido o domínio:
+        # a decisão olha a URL de ORIGEM.
+        origem = local2url.get(alvo.split("?")[0], "") or alvo
+        u = (origem + " " + alvo).lower()
+        for t in TRACKER_DOMINIOS:
+            if t in u:
+                return t, alvo, origem
+        if not any(k in u for k in UI_KEEP):
+            for t in TRACKER_SRC:
+                if t in u:
+                    return t, alvo, origem
+        return None, alvo, origem
+    for t in TRACKER_INLINE:
+        if t in corpo:
+            return t, None, ""
+    chave = "inline:" + hashlib.sha1(corpo.encode("utf-8", "replace")).hexdigest()
+    return None, chave, ""
+
+
+def coletar_indecisos(html, local2url, assets, minimo=200):
+    """Os scripts que as listas não julgaram — só eles vão para a LLM."""
+    itens, vistos = [], set()
+    for m in re.finditer(r"<script\b([^>]*)>(.*?)</script>", html, re.S):
+        attrs, corpo = m.group(1), m.group(2)
+        if "data-clone" in attrs:
+            continue                       # nosso, ou já marcado
+        porque, chave, origem = regra_script(attrs, corpo, local2url)
+        if porque or not chave or chave in vistos:
+            continue
+        if chave.startswith("inline:"):
+            texto = corpo
+        else:
+            caminho = os.path.join(os.path.dirname(assets),
+                                   chave.split("?")[0])
+            try:
+                texto = io.open(caminho, encoding="utf-8", errors="replace").read()
+            except Exception:
+                texto = ""
+        if len(texto.strip()) < minimo:
+            continue                       # curto demais para fazer mal
+        vistos.add(chave)
+        itens.append({"id": chave, "origem": origem, "texto": texto})
+    return itens
+
+
 def traduzir_termos(termos, origem, destino, lote=40, quieto=False):
     """Traduz uma lista de termos chamando o CLI do Claude (`claude -p`).
 
@@ -1003,7 +1209,7 @@ def podar_css(assets):
 def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 marcar=False, redirect="", so_frontend=False, link="",
                 idioma="", idiomas="", idioma_pos="bl", sem_idiomas=False, idioma_auto=False,
-                idioma_origem="", sem_traduzir=False):
+                idioma_origem="", sem_traduzir=False, sem_triagem=False):
     """Monta o clone local a partir de um dicionário de captura.
 
     Mesmo formato produzido por capturar.js (navegador) e por
@@ -1103,6 +1309,8 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
     # marcação decidir pelo domínio real, não pelo nome local.
     local2url = {v.split("?")[0]: k for k, v in url2local.items()}
 
+    triagem = {}          # preenchido pela triagem antes de montar()
+
     def montar(html):
         mortos = []
         if not a.manter_trackers:
@@ -1110,22 +1318,12 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 attrs, corpo = m.group(1), m.group(2)
                 if "data-clone-disabled" in attrs:
                     return m.group(0)
-                src = re.search(r'src="([^"]*)"', attrs)
-                porque = None
-                if src:
-                    alvo = src.group(1)
-                    # o src pode ter virado "assets/xxx.js" e escondido o domínio:
-                    # a decisão olha a URL de ORIGEM.
-                    origem = local2url.get(alvo.split("?")[0], "") or alvo
-                    u = (origem + " " + alvo).lower()
-                    for t in TRACKER_DOMINIOS:
-                        if t in u: porque = t; break
-                    if not porque and not any(k in u for k in UI_KEEP):
-                        for t in TRACKER_SRC:
-                            if t in u: porque = t; break
-                else:
-                    for t in TRACKER_INLINE:
-                        if t in corpo: porque = t; break
+                porque, chave, _ = regra_script(attrs, corpo, local2url)
+                if not porque and chave:
+                    # as listas não sabiam: vale o que a triagem decidiu
+                    v = triagem.get(chave) or {}
+                    if v.get("classe") == "rastreamento":
+                        porque = "triagem: " + (v.get("porque") or "rastreamento")
                 if not porque:
                     return m.group(0)
                 mortos.append(porque)
@@ -1133,6 +1331,28 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                         % (porque, attrs, corpo))
 
             html = re.sub(r"<script\b([^>]*)>(.*?)</script>", mata, html, flags=re.S)
+
+            # Guarda o JS dos dois lados ANTES de apagar: é a única janela em
+            # que dá para saber quais globais saíram com os rastreadores.
+            def _junta(removidos):
+                pedacos = []
+                for mm in re.finditer(r"<script\b([^>]*)>(.*?)</script>", html, re.S):
+                    at, cp = mm.group(1), mm.group(2)
+                    if ("data-clone-disabled" in at) != removidos:
+                        continue
+                    if "data-clone=" in at:
+                        continue                  # snippets nossos não contam
+                    sc = re.search(r'src="([^"]*)"', at)
+                    if sc:
+                        cam = os.path.join(out, sc.group(1).split("?")[0])
+                        try:
+                            cp = io.open(cam, encoding="utf-8", errors="replace").read()
+                        except Exception:
+                            cp = ""
+                    pedacos.append(cp)
+                return "\n".join(pedacos)
+
+            js_saiu, js_fica = _junta(True), _junta(False)
             html, n_ns = re.subn(r"<noscript><iframe[^>]*(?:googletagmanager|facebook)[^>]*>.*?</noscript>",
                                  "<!-- tracker noscript removido -->", html, flags=re.S)
 
@@ -1221,7 +1441,13 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                         r"<script\b(?![^>]*data-clone)[^>]*/?>\s*", "", html)
                     html, c["onattr"] = re.subn(r'\son\w+="[^"]*"', "", html)
                 else:
-                    html = re.sub(r"(<head\b[^>]*>)", lambda m: m.group(1) + STUBS, html, count=1)
+                    extra, orfaos = stubs_orfaos(js_fica, js_saiu)
+                    if orfaos:
+                        diga("stubs para globais órfãos: %s"
+                             % ", ".join("%s(%d métodos)" % (n, len(ms))
+                                         for n, ms in sorted(orfaos.items())))
+                    html = re.sub(r"(<head\b[^>]*>)",
+                                  lambda m: m.group(1) + STUBS + extra, html, count=1)
                 diga("LIMPEZA: %s" % ", ".join("%s=%d" % (k, v) for k, v in c.items() if v))
 
         if link:
@@ -1345,6 +1571,25 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 if m:
                     dicio.setdefault(c, {}).update(m)
                     fonte[c] = "origem+arquivo" if fonte.get(c) == "origem" else "arquivo"
+
+    # ── 3a-bis. triagem: o que as listas não decidiram ────────────
+    if not manter_trackers and not sem_triagem:
+        indecisos = coletar_indecisos(html, local2url, assets)
+        if indecisos:
+            v = triagem_scripts(indecisos)
+            triagem.update(v)
+            fora = [(it["id"], v[it["id"]]) for it in indecisos
+                    if v.get(it["id"], {}).get("classe") == "rastreamento"]
+            print("triagem: %d script(s) sem regra -> %d rastreamento, %d mantidos"
+                  % (len(indecisos), len(fora), len(indecisos) - len(fora)))
+            for chave, reg in fora:
+                print("   FORA  %s  (%s)" % (chave[:60], reg.get("porque", "")))
+            for it in indecisos:
+                reg = v.get(it["id"], {})
+                if reg.get("classe") != "rastreamento":
+                    print("   fica  %-46s (%s: %s)"
+                          % (it["id"][:46], reg.get("classe", "?"),
+                             reg.get("porque", "")))
 
     if sem_idiomas:
         html = montar(html)
@@ -1549,6 +1794,9 @@ def main():
     ap.add_argument("--idioma-origem", default="", metavar="COD",
                     help="idioma em que a página capturada está "
                          "(padrão: o <html lang> dela)")
+    ap.add_argument("--sem-triagem", action="store_true",
+                    help="não usa a LLM para julgar os scripts que as listas "
+                         "não decidem (mantém todos, como antes)")
     ap.add_argument("--sem-traduzir", action="store_true",
                     help="não chama o Claude para traduzir o que faltar; usa só "
                          "o que veio da captura e os i18n/<cod>.json existentes")
@@ -1578,7 +1826,8 @@ def main():
                 so_frontend=a.so_frontend, link=a.link,
                 idioma=a.idioma, idiomas=a.idiomas, idioma_pos=a.idioma_pos,
                 sem_idiomas=a.sem_idiomas, idioma_auto=a.idioma_auto,
-                idioma_origem=a.idioma_origem, sem_traduzir=a.sem_traduzir)
+                idioma_origem=a.idioma_origem, sem_traduzir=a.sem_traduzir,
+                sem_triagem=a.sem_triagem)
 
 
 if __name__ == "__main__":
