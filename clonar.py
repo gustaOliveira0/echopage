@@ -628,6 +628,12 @@ def traduzir_termos(termos, origem, destino, lote=40, quieto=False):
     return saida
 
 
+# Acima disto, os dicionários deixam de vir embutidos e passam a ser
+# buscados no clique. Abaixo, embutir é mais simples e mais rápido: um
+# idioma de landing típica dá ~6 KB gzip, menos que um ícone.
+LIMITE_EMBUTIDO = 120 * 1024
+
+
 def escrever_i18n(pasta, base, dicionarios, codigos):
     """Grava i18n/dicionarios.js.
 
@@ -636,16 +642,39 @@ def escrever_i18n(pasta, base, dicionarios, codigos):
     """
     os.makedirs(pasta, exist_ok=True)
     nomes = {c: IDIOMAS_NOME.get(c, c.upper()) for c in codigos}
-    corpo = {"padrao": codigos[0], "base": base, "codigos": codigos, "nomes": nomes,
-             "rtl": sorted(c for c in codigos if eh_rtl(c)),
-             "dic": {c: dicionarios[c] for c in codigos
-                     if c != base and dicionarios.get(c)}}
+    dic = {c: dicionarios[c] for c in codigos if c != base and dicionarios.get(c)}
+    cabeca = {"padrao": codigos[0], "base": base, "codigos": codigos,
+              "nomes": nomes, "rtl": sorted(c for c in codigos if eh_rtl(c))}
+
+    def dump(o):
+        return json.dumps(o, ensure_ascii=False, indent=1, sort_keys=True)
+
+    peso = sum(len(dump(d).encode("utf-8")) for d in dic.values())
+    embutido = peso <= LIMITE_EMBUTIDO
+
+    # limpa os d-*.js de uma rodada anterior que tenha usado o outro modo
+    for fn in os.listdir(pasta):
+        if fn.startswith("d-") and fn.endswith(".js"):
+            os.remove(os.path.join(pasta, fn))
+
+    if embutido:
+        cabeca["dic"] = dic
+    else:
+        cabeca["dic"] = {}
+        cabeca["lazy"] = {c: "i18n/d-%s.js" % c for c in dic}
+        for c, d in dic.items():
+            io.open(os.path.join(pasta, "d-%s.js" % c), "w", encoding="utf-8").write(
+                "window.__CLONE_I18N_ADD(%s,%s);\n" % (json.dumps(c), dump(d)))
+
     js = ("/* gerado pelo clonar.py — dicionários de tradução do clone.\n"
           "   Editável à mão: chave = texto original, valor = tradução. */\n"
-          "window.__CLONE_I18N = " +
-          json.dumps(corpo, ensure_ascii=False, indent=1, sort_keys=True) + ";\n")
+          "window.__CLONE_I18N = " + dump(cabeca) + ";\n"
+          "window.__CLONE_I18N_ADD=function(c,d){\n"
+          " window.__CLONE_I18N.dic[c]=d;\n"
+          " if(window.__CLONE_I18N_PRONTO)window.__CLONE_I18N_PRONTO(c);\n"
+          "};\n")
     io.open(os.path.join(pasta, "dicionarios.js"), "w", encoding="utf-8").write(js)
-    return len(js)
+    return len(js), peso, embutido
 
 
 def marcar_idiomas(html, codigos):
@@ -722,7 +751,30 @@ function coletar(){
 
 /* Sempre parte do ORIGINAL guardado, nunca do texto já trocado: assim
    trocar de idioma dez vezes seguidas dá no mesmo que trocar uma. */
+/* Dicionário grande não vem embutido: chega no clique, por <script src>
+   — que funciona até em file://, onde um fetch de .json morre em CORS. */
+var baixando={};
+function comDicionario(cod,pronto){
+  if(cod===BASE||DIC[cod]||!(CFG.lazy&&CFG.lazy[cod])){pronto();return;}
+  if(baixando[cod]){baixando[cod].push(pronto);return;}
+  baixando[cod]=[pronto];
+  window.__CLONE_I18N_PRONTO=function(c){
+    var fs=baixando[c]||[];baixando[c]=null;
+    for(var i=0;i<fs.length;i++)fs[i]();
+  };
+  var e=document.createElement("script");
+  e.src=CFG.lazy[cod];
+  e.onerror=function(){                  /* falhou: segue no idioma atual */
+    var fs=baixando[cod]||[];baixando[cod]=null;
+    for(var i=0;i<fs.length;i++)fs[i]();
+  };
+  document.head.appendChild(e);
+}
+
 function aplicar(cod,silencioso){
+  comDicionario(cod,function(){aplicarJa(cod,silencioso);});
+}
+function aplicarJa(cod,silencioso){
   var d=DIC[cod]||null,i,o,k,t;
   for(i=0;i<nos.length;i++){
     o=orig[i];k=o.trim();t=d&&d[k];
@@ -1623,7 +1675,7 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             print("   sem dicionário (--sem-traduzir): %s" % ", ".join(pendentes))
 
         codigos = [c for c in oferecidos if c == base_lang or dicio.get(c)]
-        escrever_i18n(pasta_i18n, base_lang, dicio, codigos)
+        n_js, peso, embutido = escrever_i18n(pasta_i18n, base_lang, dicio, codigos)
 
         # dicionário antes do widget, widget antes do --link: quem registra
         # o clique primeiro ganha a troca de idioma.
@@ -1640,6 +1692,10 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         print("idiomas: página em %s (%s) | padrão %s | no seletor: %s%s"
               % (base_lang, origem_de, padrao, ", ".join(codigos),
                  " | %d opções nativas religadas" % n_marc if n_marc else ""))
+        print("   dicionários: %.0f KB %s"
+              % (peso / 1024.0,
+                 "embutidos na página" if embutido
+                 else "em arquivo por idioma, buscados no clique"))
         for c in codigos:
             if c == base_lang:
                 print("   %-9s %4d termos (texto original da página)" % (c, len(termos)))

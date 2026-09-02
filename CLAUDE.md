@@ -87,6 +87,15 @@ links `<a>` para uma URL fornecida.
    direita para a esquerda (ar, he, fa, ur…) ganha `dir="rtl"` no `<html>`.
    Sigla malformada para o comando antes de gastar tradução.
 
+   **Peso.** Um idioma de landing típica dá ~15 KB (~6 KB gzip) — menos que
+   um ícone, contra os ~34 MB de imagens e vídeo de uma página dessas. Por
+   isso os dicionários vêm embutidos por padrão: a troca é instantânea e não
+   pede nada ao servidor. Passando de 120 KB somados (páginas de texto longo
+   com muitos idiomas), o clonador troca sozinho para um arquivo por idioma,
+   buscado no primeiro clique via `<script src>` — que funciona até em
+   `file://`, onde um `fetch` de `.json` morre em CORS. A saída diz qual modo
+   usou.
+
    Uma landing típica dá ~150 termos: ~2 min por idioma. Rótulo de idioma
    ("English", "日本語") não entra — cada um já está no próprio idioma.
 
