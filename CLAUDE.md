@@ -162,6 +162,17 @@ ou baixa o `.zip`. Os scripts abaixo são as peças que ele orquestra.
   `--idioma-origem <cod>` (idioma da página capturada), `--sem-traduzir`,
   `--sem-idiomas`.
 
+- **`verificar.py [nome|pasta|arquivo.zip]`** — diz se o clone está inteiro,
+  sem abrir o navegador. Sem argumento, confere todos. Sai com código 1 se
+  achou buraco. É a MESMA função que o `clonar.py` roda no fim e que o painel
+  usa no selo da lista — um veredicto só, nunca dois.
+  Confere: (a) toda referência local de todo HTML **e de todo CSS**, resolvida
+  contra o arquivo que cita (absoluta `/x.png` contra a raiz do clone);
+  (b) chamadas externas automáticas; (c) `<a>` que não vão para a oferta;
+  (d) opções de idioma marcadas.
+  O que já dava 404/403 na origem aparece à parte e **não** conta como falha —
+  o clone não mostrar o que o original também não mostra é fidelidade.
+
 - **`servir.py <nome> [porta]`** — serve em localhost com os MIME types certos
   (webp, webm, fontes).
 
@@ -173,7 +184,14 @@ caminhos relativos e editável à mão.
 
 ## Conferir antes de entregar
 
-Abrir `file:///home/gustavo/clonador-paginas/clones/<nome>/index.html` e checar:
+Primeiro o que a máquina vê — `./verificar.py <nome>` tem de terminar em
+`CLONE ÍNTEGRO`. Ele existe porque a auditoria antiga contava só os assets
+citados no HTML e dizia `faltando: 0` com 12 imagens de fundo ausentes:
+**imagem de fundo mora dentro do CSS**, e era exatamente ali que ninguém
+olhava.
+
+Depois o que só o olho vê — abrir
+`file:///home/gustavo/clonador-paginas/clones/<nome>/index.html` e checar:
 - visual idêntico ao original;
 - o seletor de idioma da própria página troca o texto na hora, inclusive no
   celular (largura estreita);

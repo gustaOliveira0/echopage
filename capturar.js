@@ -129,6 +129,9 @@
   }
 
   // ── 3. CSS: extrai backgrounds e @font-face de dentro ─────────
+  // Guarda de qual CSS veio cada url() e como ela estava escrita: se a
+  // busca der 404, dá para tentar as bases vizinhas (ver seção 4b).
+  const deCss = new Map();
   const seenCss = new Set();
   for (let round = 0; round < 2; round++) {          // 2 níveis (@import)
     for (const cu of [...urls]) {
@@ -138,7 +141,11 @@
       try {
         const t = await (await fetch(cu)).text();
         [...t.matchAll(/url\(\s*['"]?(?!data:)([^'")]+)/g)].forEach(m => {
-          try { urls.add(new URL(m[1], cu).href); } catch {}
+          try {
+            const a = new URL(m[1], cu).href;
+            urls.add(a);
+            if (!deCss.has(a)) deCss.set(a, { css: cu, bruto: m[1] });
+          } catch {}
         });
         // url() acima já cobre "@import url(...)". Aqui só a forma sem url(),
         // e o padrão NÃO pode parar no ";" — a query do Google Fonts tem ";".
@@ -157,12 +164,54 @@
   const files = {}, log = log0;
   let i = 0, bytes = 0;
   console.log('%c capturando ' + list.length + ' arquivos… ', 'background:#222;color:#0f0');
+  // ── 4b. resgate de url() de CSS que dá 404 ────────────────────
+  // Caso clássico: o CSS foi movido de pasta e o "../../images/x.png"
+  // ficou apontando um nível fora do lugar. O navegador engole calado e
+  // o fundo some — foi assim que 12 imagens sumiram de um clone sem que
+  // a auditoria acusasse nada. Aqui a gente tenta as bases vizinhas; de
+  // dentro da página o fetch é same-origin e passa pelo Cloudflare.
+  const resgatar = async u => {
+    const info = deCss.get(u);
+    if (!info || /^(https?:)?\/\//.test(info.bruto)) return null;
+    const tentativas = new Set();
+    let b = info.bruto.split('#')[0];
+    const nu = b.replace(/^(\.\.\/)+/, '');          // sem nenhum ../
+    for (let k = 0; k <= 3; k++) tentativas.add('../'.repeat(k) + nu);
+    tentativas.add('/' + nu);
+    for (const t of tentativas) {
+      let cand;
+      try { cand = new URL(t, info.css).href; } catch { continue; }
+      if (cand === u || files[cand]) continue;
+      try {
+        const r = await fetch(cand);
+        if (!r.ok) continue;
+        const bl = await r.blob();
+        if (!bl.size) continue;
+        return { blob: bl, de: cand };
+      } catch {}
+    }
+    return null;
+  };
+
   for (const u of list) {
     i++;
     try {
       // SEM credentials: com 'include' os CDNs quebram por CORS wildcard
       const r = await fetch(u);
-      if (!r.ok) { log.push('HTTP' + r.status + ' ' + u); continue; }
+      if (!r.ok) {
+        const s = await resgatar(u);
+        if (s) {
+          // grava sob a URL ORIGINAL: é ela que o CSS cita, então a
+          // reescrita do clonar.py acha sem precisar saber do resgate
+          files[u] = { b64: await b64(s.blob), type: s.blob.type, size: s.blob.size };
+          bytes += s.blob.size;
+          log.push('RESGATE ' + u + ' <- ' + s.de);
+          console.log('%c resgatada: ' + u.split('/').pop() + ' ', 'background:#222;color:#fa0');
+          continue;
+        }
+        log.push('HTTP' + r.status + ' ' + u);
+        continue;
+      }
       const b = await r.blob();
       if (!b.size) { log.push('vazio ' + u); continue; }
       files[u] = { b64: await b64(b), type: b.type, size: b.size };

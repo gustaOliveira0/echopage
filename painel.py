@@ -19,6 +19,8 @@ import threading
 import time
 import urllib.parse
 import zipfile
+
+import verificar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
@@ -87,8 +89,18 @@ def lista_clones():
                 ficha = json.load(io.open(fj, encoding="utf-8"))
             except Exception:
                 ficha = {}
+        # Conferência ao vivo, não o que a ficha diz: a ficha envelhece
+        # assim que alguém edita um arquivo à mão, e um clone que parece
+        # bom na lista e está quebrado no disco é o pior dos dois mundos.
+        try:
+            probs, res = verificar.conferir(cam, quieto=True)
+        except Exception:
+            probs, res = ["não deu para conferir"], {}
         saida.append({"nome": d, "mb": round(bytes_ / 1048576.0, 1),
                       "idiomas": idiomas,
+                      "ok": not probs,
+                      "faltando": res.get("faltando", 0),
+                      "problemas": probs,
                       "origem": ficha.get("origem", ""),
                       "link": ficha.get("link_afiliado", ""),
                       "quando": (ficha.get("quando", "") or time.strftime(
@@ -276,6 +288,8 @@ a:hover{text-decoration:underline}
 .tag{display:inline-block;background:var(--fundo2);border:1px solid var(--linha2);
  border-radius:4px;padding:1px 5px;font-size:10.5px;color:var(--fraco);
  margin:1px 2px 1px 0;font-family:ui-monospace,Menlo,monospace}
+.tag.ok{color:#7bd88f;border-color:#2f5c3b}
+.tag.ruim{color:#f2a15d;border-color:#6b4526;cursor:help}
 .zip{display:inline-block;padding:6px 12px;border:1px solid var(--linha2);
  border-radius:7px;background:transparent;color:var(--txt);
  font-size:12px;font-weight:600;white-space:nowrap;text-decoration:none}
@@ -355,7 +369,7 @@ a:hover{text-decoration:underline}
 
 <div class=cartao style="margin-top:14px">
  <p class=titulo>Clones</p>
- <table><thead><tr><th>Nome</th><th>Origem</th><th>Idiomas</th><th>Tamanho</th><th>Feito em</th><th></th></tr></thead>
+ <table><thead><tr><th>Nome</th><th>Origem</th><th>Idiomas</th><th>Conferência</th><th>Tamanho</th><th>Feito em</th><th></th></tr></thead>
  <tbody id=lista></tbody></table>
  <p class=vazio id=vazio hidden>Nenhum clone ainda.</p>
 </div>
@@ -374,8 +388,11 @@ async function lista(){
    (c.idiomas.length>6?'<span class=tag>+'+(c.idiomas.length-6)+'</span>':''):'<span class=tag>—</span>';
   const org=c.origem?('<span class=org title="'+c.origem+'">'+
    c.origem.replace(/^https?:\/\//,'').slice(0,34)+'</span>'):'<span class=org>—</span>';
+  const chk=c.ok?'<span class="tag ok">íntegro</span>'
+   :'<span class="tag ruim" title="'+(c.problemas||[]).join('; ')+'">'+
+     (c.faltando?c.faltando+' faltando':'conferir')+'</span>';
   tr.innerHTML='<td><a href="/c/'+c.nome+'/" target=_blank>'+c.nome+'</a></td>'+
-   '<td>'+org+'</td><td>'+idi+'</td><td class=num>'+c.mb+' MB</td>'+
+   '<td>'+org+'</td><td>'+idi+'</td><td>'+chk+'</td><td class=num>'+c.mb+' MB</td>'+
    '<td class=num>'+c.quando+'</td>'+
    '<td><a class=zip href="/api/zip?nome='+c.nome+'">baixar .zip</a></td>';
   tb.appendChild(tr);

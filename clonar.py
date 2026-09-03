@@ -10,6 +10,7 @@ rastreadores e audita o resultado.
 """
 import argparse, base64, hashlib, io, json, os, re, sys, time
 from html.parser import HTMLParser
+import verificar
 from urllib.parse import urlsplit, unquote, urljoin
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
@@ -1917,80 +1918,27 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         podar_css(assets)
 
     # ── 5. auditoria ──────────────────────────────────────────────
-    vivo = re.sub(r"<script\b[^>]*data-clone-disabled.*?</script>", "", html, flags=re.S)
-
-    # assets = o que o navegador busca sozinho (src, e href de <link>)
-    assets_ref = set(m.group(1) for m in re.finditer(
-        r'src="(?!https?:|//|data:|chrome-extension)([^"]+)"', vivo))
-    assets_ref |= set(m.group(1) for m in re.finditer(
-        r'<link[^>]+href="(?!https?:|//|data:)([^"]+)"', vivo))
-    # refs dentro dos CSS também contam: é onde vivem ícones e backgrounds
-    css_ref = {}
-    for fn in os.listdir(assets):
-        if not fn.endswith(".css"):
-            continue
-        c = io.open(os.path.join(assets, fn), encoding="utf-8", errors="replace").read()
-        for m in re.finditer(r"url\(\s*['\"]?(?!data:)([^'\")]+)", c):
-            u = m.group(1).strip()
-            if u.startswith(("http://", "https://", "//")):
-                continue
-            limpo = unquote(u.split("?")[0].split("#")[0])
-            base_u = os.path.basename(limpo)
-            if not os.path.exists(os.path.join(assets, limpo)) and \
-               not os.path.exists(os.path.join(assets, base_u)):
-                css_ref.setdefault(base_u, fn)
-
-    faltando = sorted(r for r in assets_ref if not os.path.exists(
-        os.path.join(out, unquote(r.split("?")[0]))))
-
-    # o que já dava 404 no site de origem não é buraco nosso — o log da
-    # captura registra isso, então dá para separar as duas coisas.
+    # A conferência é a MESMA do verificar.py, de propósito. Duas auditorias
+    # separadas davam dois veredictos: a daqui contava só os assets citados
+    # no HTML e dizia "faltando: 0" enquanto 12 imagens de fundo citadas
+    # dentro dos CSS não existiam no disco. Uma função só, um veredicto só.
+    #
+    # O log da captura separa o que é buraco nosso do que a origem já não
+    # entregava (404/403): sem isso a conferência vira alarme falso.
     log404 = set()
     for l in d.get("log", []):
         if l.startswith("HTTP404") or l.startswith("HTTP403"):
             log404.add(os.path.basename(l.split("?")[0].split("#")[0]))
 
-    css_nossos = {k: v for k, v in css_ref.items() if k not in log404}
-    css_origem = len(css_ref) - len(css_nossos)
+    print()
+    problemas, resumo = verificar.conferir(
+        out, origem_404=log404,
+        ficha={"origem": page_url, "quando": time.strftime("%Y-%m-%d %H:%M:%S")},
+        link=link)
 
-    # links de navegação: só disparam se alguém clicar
-    links_ext = sorted(set(m.group(1) for m in re.finditer(
-        r'<a [^>]*href="(https?://[^"]+)"', vivo)))
-
-    # externos que o navegador busca SOZINHO ao abrir a página
-    auto_ext = set()
-    for m in re.finditer(r'(?:src|<link[^>]+href)="(https?://[^"]+)"', vivo):
-        auto_ext.add(urlsplit(m.group(1)).netloc)
-    for m in re.finditer(r"url\(\s*['\"]?(https?://[^'\")]+)", vivo):
-        auto_ext.add(urlsplit(m.group(1)).netloc)
-    auto_ext.discard("www.w3.org")
-
-    print("\n=== AUDITORIA ===")
-    print("assets referenciados no HTML: %d | faltando: %d" % (len(assets_ref), len(faltando)))
-    for f in faltando:
-        marca = "  (já dava 404 na origem)" if os.path.basename(
-            f.split("?")[0]) in log404 else ""
-        print("   FALTA:", f, marca)
-    if css_ref:
-        print("refs quebradas dentro dos CSS: %d  (%d já davam 404 na origem)"
-              % (len(css_ref), css_origem))
-        for k, v in sorted(css_nossos.items())[:12]:
-            print("   FALTA: %s  (citado em %s)" % (k, v))
-    if auto_ext:
-        print("\n!! %d domínio(s) que a página ainda chama SOZINHA ao abrir:"
-              % len(auto_ext))
-        for dom in sorted(auto_ext):
-            print("     -", dom)
+    if resumo.get("externos"):
         print("   Se for analytics em domínio próprio, rode de novo com:")
-        print("     --bloquear %s" % ",".join(sorted(auto_ext)))
-    else:
-        print("chamadas externas automáticas: nenhuma  [OK]")
-    if links_ext:
-        print("\n%d link(s) de navegação apontam para fora (só ao clicar):" % len(links_ext))
-        for l in links_ext[:5]:
-            print("     -", l)
-        if len(links_ext) > 5:
-            print("     ... e mais %d" % (len(links_ext) - 5))
+        print("     --bloquear %s" % ",".join(resumo["externos"]))
 
     tot = sum(os.path.getsize(os.path.join(assets, f)) for f in os.listdir(assets))
     print("\ntamanho: %.1f MB em %d arquivos" % (tot / 1048576, len(os.listdir(assets))))
@@ -2004,14 +1952,18 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
         "idioma_base": locals().get("base_lang", ""),
         "idiomas": locals().get("codigos", []),
         "assets": len(os.listdir(assets)) if os.path.isdir(assets) else 0,
-        "faltando": len(faltando),
-        "externos": sorted(vivos_fora) if "vivos_fora" in locals() else [],
+        "faltando": resumo.get("faltando", 0),
+        "faltando_lista": resumo.get("faltando_lista", []),
+        "404_origem": sorted(log404),
+        "externos": resumo.get("externos", []),
+        "problemas": problemas,
         "comando": " ".join(sys.argv[1:]),
     }
     io.open(os.path.join(out, ".clone.json"), "w", encoding="utf-8").write(
         json.dumps(ficha, ensure_ascii=False, indent=1))
 
-    print("\nservir com:  ./servir.py %s" % nome)
+    print("\nservir com:    ./servir.py %s" % nome)
+    print("reconferir:    ./verificar.py %s" % nome)
 
 
 def main():
