@@ -1344,9 +1344,9 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 permitir_externos=False):
     """Monta o clone local a partir de um dicionário de captura.
 
-    Mesmo formato produzido por capturar.js (navegador) e por
-    clonar-direto.py (terminal): assim os dois caminhos compartilham toda a
-    limpeza, a reescrita de caminhos e a auditoria.
+    O formato é o que capturar.js produz — seja injetado pelo capturar.py,
+    seja colado no console à mão. Toda a limpeza, a reescrita de caminhos, os
+    idiomas e a auditoria acontecem aqui, num lugar só.
     """
     class _Args:
         pass
