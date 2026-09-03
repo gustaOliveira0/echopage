@@ -1,4 +1,4 @@
-# Projeto: Clonador de Páginas
+# Projeto: echopage (clonador de páginas)
 
 Clonar uma landing page e servi-la em `localhost` preservando todo o visual e a
 interatividade, removendo apenas o rastreamento, e (quando pedido) apontando os
@@ -99,18 +99,51 @@ links `<a>` para uma URL fornecida.
    Uma landing típica dá ~150 termos: ~2 min por idioma. Rótulo de idioma
    ("English", "日本語") não entra — cada um já está no próprio idioma.
 
-4. **Mandar toda navegação para a URL fornecida** (`--link`). Qualquer coisa
-   que levaria o visitante a **outra página** — link externo, `<a>` para outra
-   página, botão de troca de página (`<button onclick="nextPage()">` e afins),
-   submit de formulário — passa a apontar para a URL dada; o `href` visível
-   (hover) também. O que **permanece na página** não é tocado: âncoras internas
-   (`#`) e interações de UI (FAQ, slider, menu, cronômetro).
+4. **Mandar toda navegação para a URL fornecida** (`--link`). Estas páginas
+   são pre-sell: **toda saída vai para a oferta**, e não existe outro destino.
+
+   A separação que vale é **`<a>` contra o resto**:
+
+   - Um **`<a>` é um link** — tira o visitante da página, então vai para a
+     oferta. Vale para header, rodapé, "Política de privacidade", "Termos",
+     "Fale conosco", `href` relativo, absoluto, `#` pelado e
+     `javascript:void(0)`. O `href` visível (hover) também muda.
+   - **`<button>`, `<div onclick>` e afins** passam pelo filtro de interface:
+     accordion, slider, aba, hambúrguer, som, zoom, galeria e cronômetro
+     ficam; o resto vai para a oferta.
+   - **Fica de fora só** o que não sai da página: `<a href="#secao">` cuja
+     seção existe de fato (rolagem interna, accordion do Bootstrap) e o
+     seletor de idioma. `--sem-ancoras` manda até essas para a oferta.
+   - Submit de formulário vai para a oferta.
+
+   Atenção ao caso que já custou caro: `javascript:void(0)` e `#` pelado
+   **não são âncoras** — são o placeholder clássico de botão que navega por
+   JS. Tratá-los como "interno" deixou os 8 CTAs da Fungabeam mudos. E o
+   filtro de interface **não pode** valer para `<a>`: um link de header
+   dentro de `.menu` precisa redirecionar do mesmo jeito.
 
 ## Ferramentas (em `~/clonador-paginas`)
 
-- **`capturar.js`** — cole no Console (F12) da página já aberta no navegador;
-  baixa um `.json` com o HTML e todos os assets. Roda no navegador para herdar
-  a sessão e a VPN quando a página é geo-restrita.
+**O caminho normal é o painel** — o produto se chama **echopage**.
+`./painel.py` → `http://localhost:7000`:
+cola o link do site e o de afiliado, acompanha o log ao vivo, abre o clone
+ou baixa o `.zip`. Os scripts abaixo são as peças que ele orquestra.
+
+
+- **`painel.py [porta]`** — painel local (padrão 7000). Roda a rotina
+  inteira, mostra o log ao vivo, serve os clones em `/c/<nome>/` e entrega o
+  `.zip`. Tem seção de VPN/proxy e botão para configurar o navegador.
+- **`capturar.py <url>`** — dirige um Chrome de verdade por CDP e captura
+  sozinho, sem colar nada no console. Opções: `--xvfb` (tela virtual, para
+  máquina sem monitor), `--visivel` (janela real, para passar por desafio
+  interativo uma vez), `--proxy` (aceita usuário e senha), `--pais XX` (para
+  se o IP de saída não for desse país), `--configurar` (abre o perfil da
+  automação para instalar a VPN), `--conferir-ip`, `--clonar <nome>`.
+- **`cdp.py`** — cliente WebSocket/CDP mínimo, só stdlib.
+- **`proxyauth.py`** — o Chrome ignora credencial em `--proxy-server`; este
+  encaminhador local sem senha repassa para o proxy real já autenticado.
+- **`capturar.js`** — a captura em si, injetada na página pelo `capturar.py`.
+  Também dá para colar no Console (F12) à mão, se preferir.
 - **`clonar.py <captura.json> <nome> [--link "<url>"]`** — reconstrói em
   `clones/<nome>/`, remove o rastreamento, gera as páginas de idioma e, com
   `--link`, aponta os `<a>` para a URL. Imprime uma auditoria — o esperado é
@@ -146,6 +179,22 @@ Abrir `file:///home/gustavo/clonador-paginas/clones/<nome>/index.html` e checar:
   inclusive no celular (largura estreita);
 - FAQ abrindo ao clicar, cronômetro correndo, sliders/animações rodando;
 - ao passar o mouse nos `<a>`, a barra de status mostra a URL fornecida.
+
+## As três paredes, e o que resolve cada uma
+
+Confundi-las custou tempo. São independentes:
+
+| parede | sintoma | o que resolve |
+|---|---|---|
+| **Sem monitor** | precisa de tela para o Chrome | `--xvfb` (tela virtual; **não** é headless) |
+| **Desafio** | `'Um momento…'`, verificação em JS | `--visivel` uma vez; o cookie fica no perfil |
+| **Bloqueio/geo** | `'Sorry, you have been blocked'` | trocar o IP: `--proxy` ou VPN de sistema |
+
+Headless puro **não passa** pelo Cloudflare, nem com cookie salvo — o que
+ele detecta é o modo headless. Xvfb tira o monitor sem ligar o headless, e
+por isso passa. VPN de extensão costuma exigir clique em "conectar" a cada
+sessão do navegador, o que não funciona em automação; proxy ou VPN de
+sistema resolvem de vez.
 
 ## Notas de ambiente
 

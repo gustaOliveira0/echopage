@@ -1,217 +1,168 @@
-# Clonador de Páginas
+# echopage
 
-Clona uma página web inteira para rodar em `localhost` — incluindo vídeos,
-backgrounds de CSS e fontes — mesmo quando o site é **geo-restrito** ou está
-atrás de **Cloudflare** e não responde a `wget`/`curl`.
+Clona uma landing page inteira para rodar em `localhost` — HTML, CSS, imagens,
+vídeos e fontes — removendo o rastreamento, apagando os comentários e mandando
+toda a navegação para o seu link de afiliado.
 
-A captura roda **dentro do seu navegador**, então herda a sua sessão, seus
-cookies e sua VPN. É por isso que funciona onde ferramentas de linha de
-comando batem em 403.
+Feito para páginas de *pre-sell*: o resultado é uma pasta (ou um `.zip`) que
+abre offline, não telefona para ninguém, e onde **todo botão leva à oferta**.
+
+```
+python3 painel.py          →  http://localhost:7000
+```
+
+Cola o link do site, cola o link de afiliado, aperta **Clonar**. O log aparece
+ao vivo e no fim você abre no navegador ou baixa o `.zip`.
 
 ---
 
-## Caminho das pedras
+## As três paredes
 
-### 1. Abrir a página no Chrome
+Elas são independentes, e confundi-las custa tempo:
 
-Com VPN ligada, se o site exigir. Deixe a aba carregar por completo.
-
-> **Role a página até o fim antes de capturar.** Imagens e vídeos com
-> carregamento preguiçoso (*lazy load*) só entram na captura depois que
-> aparecem na tela.
-
-### 2. Rodar o capturador no console
-
-`F12` → aba **Console** → cole o conteúdo de [`capturar.js`](capturar.js) → Enter.
-
-Para pegar o script sem abrir editor:
-
-```bash
-./copiar.sh     # copia pro clipboard, ou abre no navegador se não houver ferramenta
-```
-
-Acompanhe o progresso. No fim aparece:
-
-```
->>> PRONTO — baixando captura-exemplo-com.json <<<
-```
-
-O arquivo cai em `~/Downloads/`.
-
-### 3. Reconstruir
-
-```bash
-./clonar.py ~/Downloads/captura-exemplo-com.json
-```
-
-Ou dando um nome à pasta:
-
-```bash
-./clonar.py ~/Downloads/captura-exemplo-com.json meu-clone
-```
-
-Ele grava os assets, reescreve HTML e CSS para caminhos locais, neutraliza
-os rastreadores e imprime uma auditoria no fim:
-
-```
-=== AUDITORIA ===
-refs locais: 69 | faltando: 0
-domínios externos em código ativo: nenhum
-tamanho: 41.8 MB em 86 arquivos
-```
-
-**`faltando: 0` e `chamadas externas automáticas: nenhuma` é o que você quer
-ver.** Se aparecer algo, veja [Quando falta arquivo](#quando-falta-arquivo).
-
-Antes de auditar, o script tenta baixar **do terminal** o que a captura no
-navegador não conseguiu (CDN público bloqueado por CORS) e localiza as fontes
-do Google Fonts referenciadas dentro dos CSS — é o que deixa o clone rodando
-sem internet. Para pular essa etapa: `--offline`.
-
-### 4. Servir
-
-A limpeza descrita em [Limpeza](#limpeza--sempre-automática) já rodou —
-o clone não fala com o servidor de origem nem com nenhum rastreador.
-
-```bash
-./servir.py meu-clone          # abre em http://localhost:8080
-./servir.py meu-clone 9000     # em outra porta
-./servir.py                    # lista os clones que existem
-```
-
----
-
-## Armadilhas (todas já resolvidas nos scripts)
-
-Cada uma dessas custou uma tentativa perdida. Estão documentadas para você
-não refazer o caminho errado.
-
-| Armadilha | O que acontece | Solução aplicada |
+| parede | sintoma | o que resolve |
 |---|---|---|
-| **`Ctrl+S` do Chrome** | Salva HTML e imagens, mas **ignora `<video>`** e os `url()` de dentro dos CSS | `capturar.js` varre o DOM e lê o conteúdo dos CSS |
-| **`credentials: 'include'`** | Quebra por CORS em CDN público: *"Access-Control-Allow-Origin must not be the wildcard `*` when credentials mode is include"* — derruba jQuery, Swiper, Splide | `fetch()` sem credentials |
-| **Downloads múltiplos** | O Chrome bloqueia o 2º download em diante sem gesto do usuário. Baixa 1 arquivo e os outros 11 somem **sem erro nenhum** | Tudo vai em **um único** `.json` |
-| **POST para `127.0.0.1`** | Bloqueado: *"Permission was denied for this request to access the `loopback` address space"* (Private Network Access) | Não usamos; ficou o download |
-| **`curl`/`wget` diretos** | 403 da Cloudflare — inclusive nos arquivos estáticos, não só no HTML | Captura roda no navegador |
-| **MIME de `.webp`/`.webm`** | `python -m http.server` entrega como `application/octet-stream` | `servir.py` registra os tipos certos |
-| **Extensões injetam lixo** | VPNs e afins metem `<script src="chrome-extension://…">` no HTML salvo | Neutralizados na reconstrução |
-| **Fontes ficam remotas** | O `@import` do Google Fonts vive dentro do CSS, fora do alcance da varredura do HTML | `clonar.py` varre os CSS e baixa as fontes |
-| **Substituição aninhada** | Trocar a URL pelo caminho local faz a variante curta (`/x.js`) casar dentro do resultado (`assets/x.js`) e virar `assetsassets/x.js` | Substituição em duas fases, via token |
+| **Sem monitor** | precisa de tela para o Chrome | `--xvfb` — tela virtual. **Não** é headless |
+| **Desafio** | `Um momento…`, verificação em JS | `--visivel` uma vez; o cookie fica no perfil |
+| **Bloqueio / geo** | `Sorry, you have been blocked` | trocar o IP: `--proxy` ou VPN de sistema |
+
+O Chrome **headless não passa** pelo Cloudflare — nem com o cookie salvo, porque
+o que ele detecta é o modo headless em si. O Xvfb tira o monitor **sem** ligar o
+headless, e por isso passa. Verificado com perfil zerado:
+
+```
+--headless  perfil novo     ->  'Um momento…'        (desafio)
+--headless  perfil quente   ->  'Um momento…'        (o cookie não salva)
+--xvfb      perfil novo     ->  página completa      ✓
+```
+
+VPN de extensão costuma exigir clique em "conectar" a cada sessão do navegador,
+o que não funciona em automação. Proxy ou VPN de sistema resolvem de vez.
 
 ---
 
-## Quando falta arquivo
+## Instalação
 
-A auditoria lista o que não foi encontrado. Causas, em ordem de frequência:
+Só Python 3 e Google Chrome. **Nenhuma dependência para instalar.**
 
-1. **Não rolou a página até o fim** → recarregue, role, capture de novo.
-2. **Conteúdo atrás de interação** (aba, acordeão, modal, carrossel) → abra
-   manualmente antes de capturar.
-3. **Download bloqueado** → procure o ícone de download bloqueado na barra de
-   endereço e clique em *Permitir*; ou `F5` e rode de novo.
-4. **Asset de outro domínio sem CORS** → aparece em `não capturados` no
-   console. Baixe à mão e jogue em `clones/<nome>/assets/`.
-
----
-
-## Limpeza — sempre, automática
-
-Roda em toda execução de `clonar.py` e `clonar-direto.py`. Não é opção: a
-captura baixa tudo, e a reconstrução devolve **só o frontend**.
-
-**Removido do HTML** (apagado, não apenas desativado):
-
-- scripts de rastreamento — GTM, GA4, Meta Pixel, Google Ads, TikTok,
-  Clarity, Hotjar, PostHog, Segment, Mixpanel, Amplitude, Sentry, Convert.com,
-  redes de afiliados, beacons da Cloudflare
-- pixels invisíveis (`<img>`/`<iframe>` de 1×1) e blocos `<noscript>` de tracking
-- scripts injetados por extensões do navegador (`chrome-extension://`)
-- `<link rel="preconnect|dns-prefetch|preload">` apontando para fora
-- `<meta http-equiv="Content-Security-Policy">` — a CSP da origem barraria os
-  arquivos locais
-- `integrity` e `nonce` — conferem hash do CDN e reprovariam a cópia local
-- `crossorigin` — desnecessário e atrapalha em `file://`
-- `data-go-to`, `data-href`, `data-redirect` com URL do funil original
-- `href` de `<a>` para fora vira `#`
-
-**Corrigido nos CSS:**
-
-- `url()` cujo caminho literal não resolve mas cujo arquivo está em `assets/`
-  é remapeado (cobre a variante `?#iefix` e caminhos com profundidade errada)
-- entradas mortas de `@font-face` são podadas — mas só quando sobra formato
-  válido na mesma declaração. Se todos quebraram, o problema é da origem e
-  apagar não conserta nada, então fica como está e a auditoria avisa
-
-**Adicionado:**
-
-Um bloco de stubs no-op no `<head>`. O JavaScript do site chama `fbq()`,
-`gtag()`, `posthog.capture()` — sem os rastreadores essas chamadas viram
-`ReferenceError` e derrubam o resto da página. Os stubs absorvem sem fazer
-nada e sem enviar nada.
-
-Resultado esperado na auditoria: **`chamadas externas automáticas: nenhuma`**.
-
-Para inspecionar em vez de remover (depuração), use `--marcar`: os
-rastreadores viram `type="text/plain"` com `data-clone-disabled="motivo"`.
+Para rodar sem monitor (servidor, container, ou só para não ver janela):
 
 ```bash
-./clonar.py captura.json --marcar
-grep -o 'data-clone-disabled="[^"]*"' clones/<nome>/index.html | sort | uniq -c
+sudo apt install -y xvfb
 ```
 
 ---
 
-## O que o clone preserva e o que ele corta
+## Uso
 
-**Preserva:** HTML já renderizado, CSS, JS do próprio site, imagens, vídeos,
-fontes, bibliotecas (jQuery, Swiper, Splide…).
-
-**Corta:** Google Tag Manager, GA4, Meta Pixel, TikTok, PostHog, Microsoft
-Clarity, Hotjar, Segment, Mixpanel, Amplitude, Sentry, redes de afiliados,
-beacons da Cloudflare e scripts injetados por extensões.
-
-Para reconstruir mantendo tudo ligado (**cuidado:** dispara analytics de
-verdade, com dados falsos, na conta de quem você clonou):
+### Pelo painel (recomendado)
 
 ```bash
-./clonar.py captura.json --manter-trackers
+python3 painel.py            # http://localhost:7000
 ```
 
-### Analytics em domínio próprio
+Tem campo de proxy, botão para configurar a VPN no navegador da automação,
+conferência do IP de saída, log ao vivo, lista dos clones e download do `.zip`.
 
-Muitos sites servem o rastreador pelo **próprio domínio** (proxy reverso) para
-driblar adblock — por exemplo `p.exemplo.com/static/array.js`, que é PostHog
-disfarçado. A lista genérica não tem como adivinhar esses domínios, então a
-auditoria avisa:
+### Pela linha de comando
 
+```bash
+# captura + clone num comando só
+python3 capturar.py "https://site.com/oferta" --xvfb \
+        --clonar meusite --link "https://rede.com/ABC/?uid=1"
+
+# só servir um clone que já existe
+python3 servir.py meusite 8080
 ```
-!! 1 domínio(s) que a página ainda chama SOZINHA ao abrir:
-     - p.exemplo.com
-   Se for analytics em domínio próprio, rode de novo com:
-     --bloquear p.exemplo.com
-```
 
-Confira se o domínio é rastreador mesmo (pode ser o CDN legítimo do site) e,
-se for, refaça com `--bloquear`.
+Opções de captura que importam:
+
+| opção | para quê |
+|---|---|
+| `--xvfb` | tela virtual — máquina sem monitor |
+| `--visivel` | janela real — passar por desafio interativo uma vez |
+| `--proxy URL` | sai por um proxy; aceita `http://usuario:senha@host:porta` |
+| `--pais XX` | para antes se o IP de saída não for desse país |
+| `--configurar` | abre o perfil da automação para instalar a VPN |
+| `--conferir-ip` | mostra de que IP/país o navegador está saindo |
 
 ---
 
-## Limites
+## O que o clone garante
 
-- Página **estática**. Formulários, checkout e qualquer coisa que dependa do
-  backend não funcionam — os links continuam apontando para o site original.
-- Captura **um** estado da página: um viewport, um idioma, uma variação de
-  teste A/B. Para a versão mobile, ative o modo dispositivo no DevTools,
-  recarregue e capture de novo.
-- Conteúdo carregado depois (scroll infinito, "carregar mais") só entra se
-  você provocar antes de capturar.
+**Zero chamadas externas.** Depois da limpeza, qualquer tag que ainda buscaria
+algo de fora sozinha é cortada — seja rastreador que ninguém reconheceu, seja
+asset que não veio no download. `<a href>` não é tocado: clicar continua livre.
+
+**Nenhum comentário HTML.** Some tudo. Além de não servir para nada num clone,
+um `<script>` comentado quebrava o pareamento do regex e deixava passar o
+tracker seguinte.
+
+**Toda navegação vai para o seu link.** A regra é `<a>` contra o resto:
+
+- um **`<a>` é um link** — header, rodapé, "Política de privacidade", `#` pelado,
+  `javascript:void(0)`, relativo, absoluto: tudo vai para a oferta, e o `href`
+  visível no hover também;
+- **`<button>` e `<div onclick>`** passam pelo filtro de interface — accordion,
+  slider, aba, som, hambúrguer, cronômetro ficam;
+- **fica de fora só** o que não sai da página: `<a href="#secao">` cuja seção
+  existe de fato, e o seletor de idioma.
+
+`javascript:void(0)` e `#` pelado **não são âncoras** — são o placeholder de
+botão que navega por JS. Tratá-los como internos deixava os CTAs mudos.
+
+**O frontend continua vivo.** FAQ, cronômetro, slider, animações, máscaras,
+validação: tudo preservado. Quando as listas não sabem decidir um script, a
+pergunta vai para uma LLM (`claude -p`), com "na dúvida, é interface" como regra
+de ouro — e o veredicto fica em cache por hash, julgado uma vez para sempre.
+
+**Idiomas, se a página tiver.** Página com seletor nativo sai com exatamente os
+idiomas que ela oferecia, e o **botão original dela** passa a trocar o texto na
+hora, sem recarregar. Página de um idioma só não ganha nada.
 
 ---
 
-## Uso responsável
+## Arquivos
 
-Serve para estudo de layout, referência de implementação e arquivo pessoal.
-O conteúdo continua sendo de quem o produziu — republicar um clone como se
-fosse seu é violação de direitos autorais, e reproduzir a página de uma marca
-num domínio que você controla é a mecânica de um golpe de phishing. Mantenha
-em `localhost`.
+| | |
+|---|---|
+| `painel.py` | interface web, log ao vivo, serve clones, entrega o `.zip` |
+| `capturar.py` | dirige um Chrome real por CDP e captura sozinho |
+| `capturar.js` | a captura em si, injetada na página |
+| `cdp.py` | cliente WebSocket/CDP mínimo, só stdlib |
+| `proxyauth.py` | encaminhador para proxy com usuário e senha |
+| `clonar.py` | limpeza, tracking, idiomas, links, auditoria |
+| `servir.py` | serve um clone com os MIME types certos |
+
+Cada clone vira `clones/<nome>/` com `index.html`, `assets/` e — quando há
+idiomas — `i18n/`. Uma ficha `.clone.json` registra origem, data, link e comando;
+ela **não** vai no `.zip`.
+
+---
+
+## Auditoria
+
+Toda montagem termina com um relatório. O esperado:
+
+```
+assets referenciados no HTML: 55 | faltando: 0
+chamadas externas automáticas: nenhuma  [OK]
+comentários HTML removidos: 12
+1 link(s) de navegação apontam para fora (só ao clicar):
+     - https://rede.com/ABC/?uid=1
+```
+
+`faltando` só deve ter o que já dava 404 no site de origem — o relatório separa
+os dois casos.
+
+---
+
+## Limites conhecidos
+
+- **A captura precisa do Chrome.** Não existe caminho por `curl`: páginas atrás
+  de Cloudflare respondem 403 a qualquer coisa que não seja navegador.
+- **Desafio interativo** ("verifique se você é humano") precisa de um clique
+  humano uma vez, com `--visivel`. Não há contorno de detecção de bot aqui.
+- **Bloqueio por IP** só se resolve trocando de saída.
+- **Proxy autenticado** foi validado contra um proxy local de teste; provedores
+  que rotacionam IP por conexão podem quebrar a sessão do Cloudflare no meio.
