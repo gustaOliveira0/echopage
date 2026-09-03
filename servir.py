@@ -40,6 +40,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return "text/plain" if t in (None, "application/octet-stream") else t
 
 
+# Ficha do clone: deixa claro na hora se o que está no ar é o recém-feito
+ficha = os.path.join(alvo, ".clone.json")
+if os.path.exists(ficha):
+    try:
+        import json as _j
+        f = _j.load(open(ficha, encoding="utf-8"))
+        print("clone  : %s" % nome)
+        print("origem : %s" % f.get("origem", "?"))
+        print("feito  : %s" % f.get("quando", "?"))
+        if f.get("link_afiliado"):
+            print("link   : %s" % f["link_afiliado"])
+        if f.get("idiomas"):
+            print("idiomas: %s" % ", ".join(f["idiomas"]))
+    except Exception:
+        pass
+else:
+    print("clone  : %s  (sem ficha — feito antes deste recurso)" % nome)
+
 os.chdir(alvo)
 socketserver.TCPServer.allow_reuse_address = True
 url = "http://localhost:%d/" % porta

@@ -8,9 +8,9 @@ Lê o JSON gerado por capturar.js e monta um clone local autocontido:
 grava os assets, reescreve HTML e CSS para caminhos locais, neutraliza
 rastreadores e audita o resultado.
 """
-import argparse, base64, hashlib, io, json, os, re, sys
+import argparse, base64, hashlib, io, json, os, re, sys, time
 from html.parser import HTMLParser
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urlsplit, unquote, urljoin
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
 
@@ -56,6 +56,11 @@ TRACKER_DOMINIOS = [
     # redes de afiliado/CPA: pixel de conversão, postback e cloaking
     "maxweb", "everflow", "voluum", "redtrack", "binom", "clickmagick",
     "cloaker", "trackier", "affise", "hasoffers", "cake-affiliate",
+    # plataformas de consentimento (CMP): existem para registrar e enviar
+    # a escolha do visitante, e trazem o tracking junto
+    "cookiebot", "onetrust", "cookielaw", "osano", "quantcast", "trustarc",
+    "didomi", "iubenda", "usercentrics", "termly", "cookieyes", "complianz",
+    "civiccomputing", "sourcepoint", "consentmanager",
 ]
 
 # Frontend puro. Um arquivo com um destes no nome MANTÉM, mesmo que case com
@@ -215,6 +220,9 @@ class _Segmentos(HTMLParser):
     servidor devolveu traduzida, já que as duas saem do mesmo template.
     """
 
+    VAZIAS = {"br", "img", "input", "hr", "meta", "link", "source", "area",
+              "base", "col", "embed", "param", "track", "wbr"}
+
     def __init__(self):
         HTMLParser.__init__(self, convert_charrefs=True)
         self.mudo = []
@@ -222,6 +230,21 @@ class _Segmentos(HTMLParser):
         self.atributos = []
         self.titulo = ""
         self._em_titulo = False
+        # Caminho no DOM de cada trecho. Casar a página com a versão
+        # traduzida por POSIÇÃO é tudo-ou-nada; por caminho, o que existe
+        # nas duas casa e o resto simplesmente fica de fora.
+        self.pilha = [["", {}]]
+        self.cam_textos = []
+        self.cam_atributos = []
+        self._ntxt = {}
+
+    def _caminho(self):
+        return "/".join(q[0] for q in self.pilha[1:])
+
+    def _push(self, tag):
+        cont = self.pilha[-1][1]
+        cont[tag] = cont.get(tag, 0) + 1
+        self.pilha.append(["%s[%d]" % (tag, cont[tag]), {}])
 
     def handle_starttag(self, tag, attrs):
         # "English", "日本語" e afins são rótulos do seletor: cada um já está
@@ -230,21 +253,34 @@ class _Segmentos(HTMLParser):
                            "data-locale", "hreflang", "data-clone-lang")
                      and (v or "").strip().lower() in IDIOMAS_NOME
                      for k, v in attrs)
+        vazia = tag in self.VAZIAS
+        if not vazia:
+            self._push(tag)
         if tag in IGNORA_TEXTO or rotulo:
             self.mudo.append(tag)
         if tag == "title":
             self._em_titulo = True
         if self.mudo:
             return
+        base = self._caminho() + ("/" + tag if vazia else "")
         for k, v in attrs:
             if k in ATRIB_TEXTO and v and v.strip() and _traduzivel(v):
                 self.atributos.append(v.strip())
+                self.cam_atributos.append(base + "@" + k)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag):
         if self.mudo and self.mudo[-1] == tag:
             self.mudo.pop()
         if tag == "title":
             self._em_titulo = False
+        if tag not in self.VAZIAS:
+            for i in range(len(self.pilha) - 1, 0, -1):
+                if self.pilha[i][0].split("[")[0] == tag:
+                    del self.pilha[i:]
+                    break
 
     def handle_data(self, dado):
         if self._em_titulo:
@@ -255,6 +291,9 @@ class _Segmentos(HTMLParser):
         t = dado.strip()
         if t and _traduzivel(t):
             self.textos.append(t)
+            cam = self._caminho()
+            self._ntxt[cam] = self._ntxt.get(cam, 0) + 1
+            self.cam_textos.append("%s#%d" % (cam, self._ntxt[cam]))
 
 
 def _traduzivel(t):
@@ -281,22 +320,74 @@ def segmentos(html):
 
 
 def dicionario_da_variante(html_base, html_var):
-    """Casa a página original com a versão traduzida pelo servidor.
+    """Casa a página com a versão que o servidor devolveu traduzida.
 
-    As duas vêm do mesmo template, então o texto sai na mesma ordem e o
-    pareamento é posicional. Se as contagens divergem, a variante não é o
-    mesmo template — devolve vazio em vez de inventar um alinhamento torto.
+    Casar por posição era tudo-ou-nada: um parágrafo a mais na versão
+    traduzida e o alinhamento inteiro ia fora — foi o que descartou as nove
+    traduções oficiais da Vanotium por UM atributo de diferença. Agora o par
+    é feito pelo caminho no DOM; o que sobra vai para tradução.
     """
     b, v = segmentos(html_base), segmentos(html_var)
-    if len(b.textos) != len(v.textos) or len(b.atributos) != len(v.atributos):
-        return None, (len(b.textos), len(v.textos))
-    d = {}
-    for o, t in list(zip(b.textos, v.textos)) + list(zip(b.atributos, v.atributos)):
-        if o != t and t:
-            d.setdefault(o, t)
+    pares, d = 0, {}
+    for cams_b, txt_b, cams_v, txt_v in (
+            (b.cam_textos, b.textos, v.cam_textos, v.textos),
+            (b.cam_atributos, b.atributos, v.cam_atributos, v.atributos)):
+        mapa_v = dict(zip(cams_v, txt_v))
+        for cam, o in zip(cams_b, txt_b):
+            t = mapa_v.get(cam)
+            if t is None:
+                continue
+            pares += 1
+            if t and o != t:
+                d.setdefault(o, t)
     if b.titulo and v.titulo and b.titulo != v.titulo:
         d[b.titulo] = v.titulo
-    return d, (len(b.textos), len(v.textos))
+    total = len(b.textos) + len(b.atributos)
+    return d, (pares / float(total) if total else 0.0)
+
+
+# ── página que não é a página ────────────────────────────────────
+# Cloudflare e afins devolvem 200 com um HTML de bloqueio ou de desafio.
+# Sem reconhecer isso, o clonador empacota a tela de erro achando que é o
+# site — foi o que aconteceu com buyskyline.co.
+BLOQUEIO = [
+    "sorry, you have been blocked", "attention required", "access denied",
+    "you are unable to access", "you have been blocked", "acesso negado",
+    "você foi bloqueado", "voce foi bloqueado", "403 forbidden",
+    "error 1020", "error 1015", "error 1006", "ip address has been banned",
+    "request blocked", "acesso restrito", "not available in your country",
+    "não está disponível no seu país", "blocked by the network",
+]
+DESAFIO = [
+    "just a moment", "um momento", "checking your browser",
+    "verifying you are human", "verificando se você é humano",
+    "verificando o seu navegador", "enable javascript and cookies",
+    "please enable cookies", "ddos protection by", "challenge-platform",
+    "cf-challenge", "cf_chl_opt", "__cf_chl", "turnstile",
+]
+
+
+def diagnostica_pagina(html, titulo="", texto="", recursos=None):
+    """Diz se o que veio é a página mesmo, um desafio ou um bloqueio.
+
+    Devolve (situacao, motivo) com situacao em ok/desafio/bloqueado.
+    Bloqueio e desafio pedem coisas diferentes: desafio às vezes passa com
+    janela na tela; bloqueio é a rede recusando o IP — só troca de saída.
+    """
+    baixo = ((titulo or "") + " " + (texto or "")[:4000] + " "
+             + html[:8000]).lower()
+    for m in BLOQUEIO:
+        if m in baixo:
+            return "bloqueado", m
+    for m in DESAFIO:
+        if m in baixo:
+            return "desafio", m
+    # sinal de forma: quase nada de texto e quase nenhum recurso
+    if texto is not None and len((texto or "").strip()) < 250 and \
+            (recursos is not None and recursos <= 3) and \
+            "cloudflare" in baixo:
+        return "bloqueado", "página vazia servida pelo Cloudflare"
+    return "ok", ""
 
 
 def normaliza_codigo(c):
@@ -507,6 +598,64 @@ def stubs_orfaos(js_fica, js_saiu):
             'interface quebraria */\n' + "\n".join(partes) + "\n</script>"), orfaos
 
 
+def neutraliza_externos(html):
+    """Corta o que ainda carregaria de fora sozinho ao abrir a página.
+
+    As listas e a triagem pegam o que se reconhece. Isto é a rede embaixo:
+    se depois de tudo alguma tag ainda aponta para http(s) e é buscada
+    sozinha, ela sai — seja tracker que ninguém reconheceu, seja asset que
+    não veio no download. Um clone que telefona para fora não é um clone.
+
+    Clicar continua livre: <a href> não é tocado aqui.
+    """
+    c, dominios = {}, set()
+
+    def anota(u):
+        m = re.match(r"https?://([^/\s\"']+)", u or "")
+        if m:
+            dominios.add(m.group(1).lower())
+
+    def fora(m):
+        anota(m.group(0))
+        return ""
+
+    ext = r'(?:src|data-src|href)\s*=\s*"https?://'
+    html, c["scripts"] = re.subn(
+        r'<script\b(?![^>]*data-clone)[^>]*' + ext + r'[^"]*"[^>]*>.*?</script>\s*',
+        fora, html, flags=re.S | re.I)
+    html, c["iframes"] = re.subn(
+        r'<iframe\b[^>]*' + ext + r'[^"]*"[^>]*>.*?</iframe>\s*',
+        fora, html, flags=re.S | re.I)
+    html, c["iframes2"] = re.subn(
+        r'<iframe\b[^>]*' + ext + r'[^"]*"[^>]*>\s*', fora, html, flags=re.I)
+    html, c["links"] = re.subn(
+        r'<link\b[^>]*href\s*=\s*"https?://[^"]*"[^>]*>\s*', fora, html, flags=re.I)
+
+    # imagem e <source>: a tag fica (o layout depende dela), o endereço sai
+    def limpa_media(m):
+        tag = m.group(0)
+        if not re.search(r'(?:src|srcset|poster)\s*=\s*"https?://', tag, re.I):
+            return tag
+        for a in ("src", "srcset", "poster", "data-src", "data-srcset"):
+            v = re.search(r'\b%s\s*=\s*"([^"]*)"' % a, tag, re.I)
+            if v and re.search(r"https?://", v.group(1)):
+                anota(v.group(1))
+                tag = re.sub(r'\s\b%s\s*=\s*"[^"]*"' % a, "", tag, flags=re.I)
+                c["media"] = c.get("media", 0) + 1
+        return tag.replace(">", ' data-clone-disabled="externo">', 1)
+
+    html = re.sub(r"<(?:img|source|video|audio)\b[^>]*>", limpa_media, html, flags=re.I)
+
+    # background externo em style inline
+    def limpa_style(m):
+        anota(m.group(1))
+        c["style"] = c.get("style", 0) + 1
+        return "url()"
+
+    html = re.sub(r'url\(\s*[\'"]?(https?://[^)\'"]+)[\'"]?\s*\)', limpa_style, html)
+    return html, {k: v for k, v in c.items() if v}, sorted(dominios)
+
+
 def regra_script(attrs, corpo, local2url):
     """Decide um <script> pelas listas. Devolve (porque, chave, origem).
 
@@ -707,41 +856,34 @@ def marcar_idiomas(html, codigos):
     return html, n[0]
 
 
-CANTOS = {"bl": "left:16px;bottom:16px", "br": "right:16px;bottom:16px",
-          "tl": "left:16px;top:16px", "tr": "right:16px;top:16px"}
-
 _I18N_JS = r"""
 (function(){
-var CFG=window.__CLONE_I18N||{dic:{},nomes:{},padrao:"__PADRAO__"};
-var DIC=CFG.dic||{}, NOMES=CFG.nomes||{}, PADRAO=CFG.padrao||"__PADRAO__";
-var CHAVE="clone-i18n", AUTO=__AUTO__, BASE=CFG.base||PADRAO;
+var CFG=window.__CLONE_I18N||{dic:{},nomes:{}};
+var DIC=CFG.dic||{}, NOMES=CFG.nomes||{}, BASE=CFG.base||"";
 var RTL=CFG.rtl||[], DIR0=document.documentElement.getAttribute("dir")||"";
-/* a ordem é a que veio em --idiomas; o padrão é o primeiro */
-var codigos=(CFG.codigos&&CFG.codigos.length?CFG.codigos:Object.keys(DIC)).slice();
-if(codigos.indexOf(PADRAO)<0)codigos.unshift(PADRAO);
+var CODIGOS=CFG.codigos||[];
+function temIdioma(c){return c===BASE||CODIGOS.indexOf(c)>=0||!!DIC[c];}
+var CHAVE="clone-i18n";
 
 /* ── o que dá para traduzir na tela ───────────────────────────── */
-var nos=[],orig=[],ats=[],aorig=[],tit=document.title.trim(),atual=PADRAO;
+var nos=[],orig=[],ats=[],aorig=[],tit=document.title.trim(),atual=BASE;
 var MUDO=/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG|CODE|PRE)$/;
 
-function nosso(el){
-  while(el){ if(el.getAttribute&&el.hasAttribute("data-clone-ui"))return true;
-             el=el.parentNode||el.host; }
-  return false;
-}
 function coletar(){
   nos=[];orig=[];ats=[];aorig=[];
   if(!document.body)return;
   var w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,null,false),n;
   while((n=w.nextNode())){
     var p=n.parentNode;
-    if(!p||MUDO.test(p.nodeName)||!n.nodeValue.trim()||nosso(p))continue;
+    if(!p||MUDO.test(p.nodeName)||!n.nodeValue.trim())continue;
+    /* o rótulo de cada opção do seletor já está no idioma dele */
+    if(p.closest&&p.closest("[data-clone-lang]"))continue;
     nos.push(n);orig.push(n.nodeValue);
   }
   var A=["alt","title","placeholder","aria-label"];
   var els=document.body.querySelectorAll("[alt],[title],[placeholder],[aria-label]");
   for(var i=0;i<els.length;i++){
-    if(nosso(els[i]))continue;
+    if(els[i].closest("[data-clone-lang]"))continue;
     for(var j=0;j<A.length;j++){
       var v=els[i].getAttribute(A[j]);
       if(v&&v.trim()){ats.push([els[i],A[j]]);aorig.push(v);}
@@ -749,8 +891,18 @@ function coletar(){
   }
 }
 
-/* Sempre parte do ORIGINAL guardado, nunca do texto já trocado: assim
-   trocar de idioma dez vezes seguidas dá no mesmo que trocar uma. */
+/* Nome do idioma pelo próprio navegador: serve para qualquer sigla. */
+var cacheNome={};
+function nome(c){
+  if(cacheNome[c])return cacheNome[c];
+  var n="";
+  try{ n=new Intl.DisplayNames([c],{type:"language"}).of(c)||""; }catch(_){}
+  if(!n||n.toLowerCase()===c.toLowerCase())n=NOMES[c]||"";
+  if(!n)n=c.toUpperCase();
+  if(n[0]&&n[0].toLowerCase()===n[0])n=n[0].toLocaleUpperCase(c)+n.slice(1);
+  return (cacheNome[c]=n);
+}
+
 /* Dicionário grande não vem embutido: chega no clique, por <script src>
    — que funciona até em file://, onde um fetch de .json morre em CORS. */
 var baixando={};
@@ -759,21 +911,21 @@ function comDicionario(cod,pronto){
   if(baixando[cod]){baixando[cod].push(pronto);return;}
   baixando[cod]=[pronto];
   window.__CLONE_I18N_PRONTO=function(c){
-    var fs=baixando[c]||[];baixando[c]=null;
-    for(var i=0;i<fs.length;i++)fs[i]();
+    var f=baixando[c]||[];baixando[c]=null;
+    for(var i=0;i<f.length;i++)f[i]();
   };
   var e=document.createElement("script");
   e.src=CFG.lazy[cod];
-  e.onerror=function(){                  /* falhou: segue no idioma atual */
-    var fs=baixando[cod]||[];baixando[cod]=null;
-    for(var i=0;i<fs.length;i++)fs[i]();
-  };
+  e.onerror=function(){var f=baixando[cod]||[];baixando[cod]=null;
+                       for(var i=0;i<f.length;i++)f[i]();};
   document.head.appendChild(e);
 }
 
 function aplicar(cod,silencioso){
   comDicionario(cod,function(){aplicarJa(cod,silencioso);});
 }
+/* Sempre parte do ORIGINAL guardado, nunca do texto já trocado: assim
+   trocar de idioma dez vezes dá no mesmo que trocar uma. */
 function aplicarJa(cod,silencioso){
   var d=DIC[cod]||null,i,o,k,t;
   for(i=0;i<nos.length;i++){
@@ -786,151 +938,59 @@ function aplicarJa(cod,silencioso){
   }
   document.title=(d&&d[tit])||tit;
   document.documentElement.setAttribute("lang",cod);
-  /* árabe, hebraico, persa e afins: sem dir=rtl o texto entra invertido */
   if(RTL.indexOf(cod.split("-")[0])>=0)
     document.documentElement.setAttribute("dir","rtl");
   else if(DIR0)document.documentElement.setAttribute("dir",DIR0);
   else document.documentElement.removeAttribute("dir");
   atual=cod;
   if(!silencioso){try{localStorage.setItem(CHAVE,cod);}catch(_){}}
-  /* o seletor nativo da página, se existir, acompanha a escolha */
+  /* o seletor da própria página mostra a escolha */
   var op=document.querySelectorAll("[data-clone-lang]");
   for(i=0;i<op.length;i++){
     var c=op[i].getAttribute("data-clone-lang");
     if(op[i].classList)op[i].classList[c===cod?"add":"remove"]("active");
+    if(op[i].tagName==="OPTION")op[i].selected=(c===cod);
   }
-  var dl=document.querySelector(".default-lang,.current-lang,[data-lang-atual]");
-  if(dl&&!nosso(dl))dl.textContent=nome(cod);
-  pintar();
+  var rot=document.querySelectorAll(
+    ".default-lang,.current-lang,.selected-lang,[data-lang-atual]");
+  for(i=0;i<rot.length;i++)
+    if(!rot[i].closest("[data-clone-lang]"))rot[i].textContent=nome(cod);
 }
 
-/* ── botão flutuante, isolado da página em Shadow DOM ──────────── */
-var host,sh,pill,menu;
-var ESTILO='<style>'+
-':host{all:initial;display:block;position:fixed;z-index:2147483647;__CANTO__}'+
-'*{box-sizing:border-box;font:500 13px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}'+
-'.pill{display:flex;align-items:center;gap:7px;padding:9px 13px;border:1px solid rgba(15,15,15,.14);'+
- 'border-radius:999px;background:#fff;color:#1a1a1a;cursor:pointer;'+
- 'box-shadow:0 2px 10px rgba(0,0,0,.13),0 0 0 1px rgba(255,255,255,.6);'+
- 'transition:transform .12s ease,box-shadow .12s ease}'+
-'.pill:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,.18)}'+
-'.pill svg{flex:0 0 auto}'+
-'.ch{opacity:.5;font-size:10px;transition:transform .18s}'+
-'.aberto .ch{transform:rotate(180deg)}'+
-'.menu{position:absolute;min-width:190px;max-height:60vh;overflow:auto;padding:6px;'+
- 'background:#fff;color:#1a1a1a;border:1px solid rgba(15,15,15,.14);border-radius:12px;'+
- 'box-shadow:0 8px 30px rgba(0,0,0,.2);__MENUPOS__}'+
-'.menu[hidden]{display:none}'+
-'.cod{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'+
-'.cur{display:none;font-weight:700;letter-spacing:.02em}'+
-'@media (max-width:520px){'+
- '.pill{padding:10px 12px}'+
- '.cod{display:none}.cur{display:inline}'+
- '.menu{position:fixed;left:10px;right:10px;width:auto;min-width:0;'+
-  'max-height:min(58vh,420px);__MENUMOB__}'+
- '.it{padding:12px 12px;font-size:15px}'+
-'}'+
-'@media (hover:none){.it{padding:13px 12px}}'+
-
-'.it{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;'+
- 'padding:8px 10px;border:0;border-radius:8px;background:none;color:inherit;'+
- 'text-align:left;cursor:pointer;font:inherit}'+
-'.it:hover{background:rgba(15,15,15,.06)}'+
-'.it[aria-selected="true"]{background:#e9f2ff;color:#0b63ce;font-weight:600}'+
-'.tick{opacity:0}.it[aria-selected="true"] .tick{opacity:1}'+
-'@media (prefers-color-scheme:dark){'+
- '.pill,.menu{background:#1f2023;color:#f0f0f0;border-color:rgba(255,255,255,.16);'+
-  'box-shadow:0 2px 10px rgba(0,0,0,.5)}'+
- '.it:hover{background:rgba(255,255,255,.09)}'+
- '.it[aria-selected="true"]{background:#16324f;color:#8ab8f5}}'+
-'</style>';
-var GLOBO='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" '+
- 'stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18'+
- 'a15 15 0 0 1 0-18"/></svg>';
-
-/* O nome de cada idioma sai do próprio navegador (Intl.DisplayNames), no
-   idioma dele: "Deutsch", "Kiswahili", "العربية". Assim qualquer sigla
-   BCP-47 funciona sem tabela nenhuma. NOMES só entra como reserva. */
-var nomeCache={};
-function nome(c){
-  if(nomeCache[c])return nomeCache[c];
-  var n="";
-  try{ n=new Intl.DisplayNames([c],{type:"language"}).of(c)||""; }catch(_){}
-  if(!n||n.toLowerCase()===c.toLowerCase())n=NOMES[c]||"";
-  if(!n)n=c.toUpperCase();
-  if(n&&n[0]&&n[0].toLowerCase()===n[0])n=n[0].toLocaleUpperCase(c)+n.slice(1);
-  return (nomeCache[c]=n);
-}
-function pintar(){
-  if(!sh)return;
-  sh.querySelector(".cod").textContent=nome(atual);
-  sh.querySelector(".cur").textContent=atual.split("-")[0].toUpperCase();
-  var its=sh.querySelectorAll(".it");
-  for(var i=0;i<its.length;i++)
-    its[i].setAttribute("aria-selected",its[i].dataset.cod===atual?"true":"false");
-}
-function abrir(v){
-  if(v)menu.removeAttribute("hidden");else menu.setAttribute("hidden","");
-  pill.classList[v?"add":"remove"]("aberto");
-  pill.setAttribute("aria-expanded",v?"true":"false");
-}
-function montar(){
-  if(codigos.length<2)return;              /* um idioma só: sem botão */
-  host=document.createElement("div");
-  host.setAttribute("data-clone-ui","i18n");
-  host.setAttribute("data-clone-widget","i18n");
-  host.style.cssText="position:fixed;z-index:2147483647";
-  sh=host.attachShadow({mode:"open"});
-  var itens="";
-  for(var i=0;i<codigos.length;i++)
-    itens+='<button class="it" role="option" data-cod="'+codigos[i]+'" lang="'+codigos[i]+'">'+
-           '<span>'+nome(codigos[i])+'</span><span class="tick">✓</span></button>';
-  sh.innerHTML=ESTILO+
-    '<button class="pill" aria-haspopup="listbox" aria-expanded="false" aria-label="Idioma">'+
-    GLOBO+'<span class="cod"></span><span class="cur"></span><span class="ch">▾</span></button>'+
-    '<div class="menu" role="listbox" hidden>'+itens+'</div>';
-  document.body.appendChild(host);
-  pill=sh.querySelector(".pill");menu=sh.querySelector(".menu");
-  pill.addEventListener("click",function(e){
-    e.stopPropagation();abrir(menu.hasAttribute("hidden"));});
-  var its=sh.querySelectorAll(".it");
-  for(var i=0;i<its.length;i++)its[i].addEventListener("click",function(e){
-    e.stopPropagation();aplicar(this.dataset.cod);abrir(false);});
-  document.addEventListener("click",function(){if(menu)abrir(false);});
-  addEventListener("keydown",function(e){if(e.key==="Escape")abrir(false);});
-}
-
-/* Seletor nativo da página (marcado com data-clone-lang) troca o idioma
-   pelo mesmo caminho. Captura, e antes do snippet de --link, senão o
-   clique em "English" viraria clique na oferta. */
-document.addEventListener("click",function(e){
-  var el=e.target;
+/* O CONTROLE é o seletor que a página já tem. Captura, e antes do snippet
+   de --link, senão o clique em "English" viraria clique na oferta. */
+function codigoDe(el){
   while(el&&el!==document.documentElement){
-    if(el.getAttribute&&el.hasAttribute("data-clone-lang")){
-      var c=el.getAttribute("data-clone-lang");
-      e.preventDefault();e.stopPropagation();
-      if(e.stopImmediatePropagation)e.stopImmediatePropagation();
-      if(DIC[c]||c===BASE)aplicar(c);
-      return;
-    }
+    if(el.getAttribute&&el.hasAttribute("data-clone-lang"))
+      return el.getAttribute("data-clone-lang");
     el=el.parentElement;
   }
+  return null;
+}
+document.addEventListener("click",function(e){
+  var c=codigoDe(e.target);
+  if(c===null)return;
+  e.preventDefault();e.stopPropagation();
+  if(e.stopImmediatePropagation)e.stopImmediatePropagation();
+  if(temIdioma(c))aplicar(c);
+},true);
+/* seletor em <select>: troca não vem por clique */
+document.addEventListener("change",function(e){
+  var el=e.target;
+  if(!el||el.tagName!=="SELECT")return;
+  var o=el.options&&el.options[el.selectedIndex];
+  var c=o&&o.getAttribute&&o.getAttribute("data-clone-lang");
+  if(!c)return;
+  e.preventDefault();e.stopPropagation();
+  if(e.stopImmediatePropagation)e.stopImmediatePropagation();
+  if(temIdioma(c))aplicar(c);
 },true);
 
 function iniciar(){
-  coletar();montar();
+  coletar();
   var esc=null;
   try{esc=localStorage.getItem(CHAVE);}catch(_){}
-  /* A 1ª visita abre no idioma padrão escolhido no comando. Só com
-     --idioma-auto a página tenta adivinhar pelo idioma do navegador. */
-  if(!esc&&AUTO){
-    var n=(navigator.language||"").toLowerCase();
-    if(DIC[n])esc=n;
-    else{var b=n.split("-")[0];
-         for(var i=0;i<codigos.length;i++)
-           if(codigos[i]===b||codigos[i].split("-")[0]===b){esc=codigos[i];break;}}
-  }
-  aplicar(esc&&(DIC[esc]||esc===BASE)?esc:PADRAO,true);
+  aplicar(esc&&temIdioma(esc)?esc:BASE,true);
 }
 if(document.readyState==="loading")
   document.addEventListener("DOMContentLoaded",iniciar);
@@ -939,66 +999,84 @@ else iniciar();
 """
 
 
-def i18n_snippet(padrao, canto="bl", auto=False):
-    pos = CANTOS.get(canto, CANTOS["bl"])
-    menupos = ("bottom:calc(100% + 8px);left:0" if canto[0] == "b" else
-               "top:calc(100% + 8px);left:0")
-    if canto[1] == "r":
-        menupos = menupos.replace("left:0", "right:0")
-    menumob = "bottom:72px" if canto[0] == "b" else "top:72px"
-    js = (_I18N_JS.replace("__PADRAO__", padrao)
-                  .replace("__CANTO__", pos)
-                  .replace("__MENUPOS__", menupos)
-                  .replace("__MENUMOB__", menumob)
-                  .replace("__AUTO__", "1" if auto else "0"))
-    return '<script data-clone="i18n">' + js + "</script>"
+def i18n_snippet():
+    return '<script data-clone="i18n">' + _I18N_JS + "</script>"
 
 
-def link_snippet(dest):
+def link_snippet(dest, sem_ancoras=False):
     """Manda TODA navegação para o destino, sem quebrar a UI.
 
-    - sobrescreve funções de troca de página (nextPage, goToCheckout...);
-    - intercepta cliques em <a>/<button>/onclick que levam a outra página;
-    - intercepta o submit de formulários.
-    O que permanece na página — âncoras internas (#) e elementos de FAQ,
-    slider, menu — não é redirecionado.
+    A separação que importa: um <a> é um link — sai da página, então vai
+    para a oferta, esteja dentro de um .menu ou não. O que NÃO é <a>
+    (button, div com onclick) passa pelo filtro de interface, porque aí
+    sim é onde vivem accordion, slider, aba, som e afins.
+
+    Fica de fora só: âncora que aponta para um id existente (rolagem na
+    própria página, accordion do Bootstrap), o seletor de idioma e as
+    peças que o clonador injetou.
     """
     d = dest.replace("\\", "\\\\").replace('"', '\\"')
+    # âncora viva = aponta para um id que existe. "#" e "javascript:" não
+    # são âncoras: são placeholder de botão que navega por JS — era por
+    # onde os CTAs escapavam mudos.
+    viva_js = ('function viva(a){return false;}\n' if sem_ancoras else
+               'function viva(a){var h=a.getAttribute("href")||"";'
+               'if(h.charAt(0)!=="#"||h.length<2)return false;'
+               'var id=h.slice(1);'
+               'try{if(document.getElementById(id))return true;}catch(_){}'
+               'try{if(document.getElementsByName(id).length)return true;}catch(_){}'
+               'return false;}\n')
     return (
         '<script data-clone="link">\n'
         '(function(){var DEST="' + d + '";\n'
+        # classes/ids de interface — só valem para o que NÃO é <a>
         'var UI=/faq|accordion|collaps|toggle|question|answer|swiper|splide|'
-        'slider|carousel|\\btabs?\\b|dropdown|hamburger|menu|modal|popup|'
-        'lightbox|tooltip|counter|countdown|timer|lang|idioma|locale|switcher/i;\n'
+        'slider|carousel|\\btabs?\\b|dropdown|hamburger|modal|popup|'
+        'lightbox|tooltip|counter|countdown|timer|sound|mute|volume|play|pause|'
+        'zoom|thumb|gallery|lang|idioma|locale|switcher/i;\n'
         'function cls(el){if(!el||el.className==null)return "";'
         'var c=el.className;return (c.baseVal!==undefined?c.baseVal:c)+"";}\n'
         'function ui(el){while(el&&el!==document.documentElement){'
         'if(UI.test(cls(el)))return true;if(el.getAttribute){'
-        'if(el.hasAttribute("data-clone-lang")||el.hasAttribute("data-clone-ui"))return true;'
         'if(UI.test(el.getAttribute("id")||""))return true;'
-        'var r=el.getAttribute("role")||"";if(/tab|menuitem|switch/.test(r))return true;}'
+        'var r=el.getAttribute("role")||"";'
+        'if(/tab|menuitem|switch/.test(r))return true;}'
         'el=el.parentElement;}return false;}\n'
-        'function interno(h){return !h||h.charAt(0)==="#"||h.indexOf("javascript:")===0;}\n'
+        + viva_js
+        + 'function nosso(el){return el.getAttribute&&('
+        'el.hasAttribute("data-clone-lang")||el.hasAttribute("data-clone-ui"));}\n'
         '["nextPage","goToCheckout","goToOrder","redirectToCheckout","toCheckout",'
-        '"gotoCheckout"].forEach(function(f){try{window[f]=function(){location.href=DEST;};}catch(_){}});\n'
-        'function fix(){var as=document.querySelectorAll("a[href]");'
-        'for(var i=0;i<as.length;i++){var a=as[i];var h=a.getAttribute("href");'
-        'if(interno(h)||ui(a))continue;a.setAttribute("href",DEST);'
-        'a.removeAttribute("target");a.removeAttribute("onclick");}}\n'
+        '"gotoCheckout","comprar","checkout","order"].forEach(function(f){'
+        'try{window[f]=function(){location.href=DEST;};}catch(_){}});\n'
+        # o href visível (hover) também aponta para a oferta
+        'function fix(){var as=document.querySelectorAll("a");'
+        'for(var i=0;i<as.length;i++){var a=as[i];'
+        'if(nosso(a)||a.closest("[data-clone-lang],[data-clone-ui]"))continue;'
+        'if(viva(a))continue;'
+        'a.setAttribute("href",DEST);a.removeAttribute("target");'
+        'a.removeAttribute("onclick");}}\n'
         'fix();document.addEventListener("DOMContentLoaded",fix);\n'
-        'function nav(el){while(el&&el!==document.documentElement){'
-        'var t=el.tagName?el.tagName.toLowerCase():"";'
-        'if(t==="a"){return interno(el.getAttribute("href"))?null:el;}'
-        'if(t==="button"){if((el.getAttribute("type")||"").toLowerCase()!=="reset")return el;}'
-        'if(t==="input"){var y=(el.type||"").toLowerCase();'
-        'if(y==="submit"||y==="button"||y==="image")return el;}'
-        'if(el.getAttribute&&el.hasAttribute("onclick"))return el;'
-        'el=el.parentElement;}return null;}\n'
+        'function go(e){e.preventDefault();e.stopPropagation();'
+        'if(e.stopImmediatePropagation)e.stopImmediatePropagation();'
+        'location.href=DEST;}\n'
         'document.addEventListener("click",function(e){'
-        'if(ui(e.target))return;if(nav(e.target)){e.preventDefault();e.stopPropagation();'
-        'if(e.stopImmediatePropagation)e.stopImmediatePropagation();location.href=DEST;}},true);\n'
+        'var el=e.target,alvo=null,ehA=false;'
+        'while(el&&el!==document.documentElement){'
+        'if(nosso(el))return;'                       # nosso widget/idioma
+        'var t=el.tagName?el.tagName.toLowerCase():"";'
+        'if(t==="a"){if(viva(el))return;alvo=el;ehA=true;break;}'
+        'if(t==="button"){if((el.getAttribute("type")||"").toLowerCase()!=="reset")'
+        '{alvo=el;break;}}'
+        'if(t==="input"){var y=(el.type||"").toLowerCase();'
+        'if(y==="submit"||y==="button"||y==="image"){alvo=el;break;}}'
+        'if(el.getAttribute&&el.hasAttribute("onclick")){alvo=el;break;}'
+        'el=el.parentElement;}\n'
+        'if(!alvo)return;'
+        'if(!ehA&&ui(alvo))return;'                  # filtro de UI só p/ não-<a>
+        'go(e);},true);\n'
         'document.addEventListener("submit",function(e){'
-        'if(ui(e.target))return;e.preventDefault();location.href=DEST;},true);\n'
+        'if(e.target&&e.target.closest&&e.target.closest("[data-clone-ui]"))return;'
+        'go(e);},true);\n'
         '})();\n</script>')
 
 
@@ -1260,8 +1338,10 @@ def podar_css(assets):
 
 def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 marcar=False, redirect="", so_frontend=False, link="",
-                idioma="", idiomas="", idioma_pos="bl", sem_idiomas=False, idioma_auto=False,
-                idioma_origem="", sem_traduzir=False, sem_triagem=False):
+                sem_ancoras=False,
+                sem_idiomas=False,
+                idioma_origem="", sem_traduzir=False, sem_triagem=False,
+                permitir_externos=False):
     """Monta o clone local a partir de um dicionário de captura.
 
     Mesmo formato produzido por capturar.js (navegador) e por
@@ -1285,6 +1365,21 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
     out = os.path.join(RAIZ, "clones", nome)
     assets = os.path.join(out, "assets")
     os.makedirs(assets, exist_ok=True)
+
+    sit, motivo = diagnostica_pagina(
+        html, d.get("title", ""), None, len(files))
+    if sit != "ok":
+        sys.exit(
+            "ERRO: a captura não é a página — é %s (%r).\n"
+            "      Título capturado: %r\n"
+            "      Clonar isso empacotaria a tela de erro no lugar do site.\n"
+            "      %s"
+            % ("um bloqueio" if sit == "bloqueado" else "um desafio",
+               motivo, d.get("title", ""),
+               "Bloqueio é a rede recusando seu IP: use VPN ou --proxy."
+               if sit == "bloqueado" else
+               "Desafio costuma passar com --visivel (resolva uma vez; "
+               "o cookie fica salvo)."))
 
     print("origem : %s" % page_url)
     print("titulo : %s" % d.get("title", "?"))
@@ -1348,6 +1443,80 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 n_cb += k
         n += n_cb
 
+            # ── referências relativas, resolvidas contra a URL da página ──
+        # Gerar variantes de cada asset não alcança uma página que mora num
+        # subdiretório: em /smartring/en/us/int2 o HTML escreve
+        # "css/reset.css" e "../../../../css/x.css", formas que nenhuma
+        # variante prevê. Resolver a referência contra a URL da página, sim
+        # — e é exato, não chute. Sem isto o clone vinha só com o HTML.
+        por_abs = dict(url2local)
+        por_sem_q = {}
+        por_base = {}
+        for u, l in url2local.items():
+            por_sem_q.setdefault(u.split("?")[0], l)
+            por_base.setdefault(unquote(os.path.basename(urlsplit(u).path)), l)
+
+        def acha_local(u):
+            try:
+                a = urljoin(page_url, u)
+            except Exception:
+                return None
+            if urlsplit(a).netloc != urlsplit(page_url).netloc:
+                return None
+            return (por_abs.get(a) or por_sem_q.get(a.split("?")[0])
+                    or por_base.get(unquote(os.path.basename(
+                        urlsplit(a).path))))
+
+        n_rel = [0]
+
+        def troca_ref(m):
+            pre, u, pos = m.group(1), m.group(2), m.group(3)
+            if not u or u.startswith(("http://", "https://", "//", "data:",
+                                      "#", "javascript:", "mailto:", "tel:",
+                                      "assets/", "\x00")):
+                return m.group(0)
+            l = acha_local(u)
+            if not l:
+                return m.group(0)
+            n_rel[0] += 1
+            return pre + l + pos
+
+        html = re.sub(
+            r'((?:src|href|poster|data-src|data-lazy-src|data-original)\s*=\s*")'
+            r'([^"]*)(")', troca_ref, html)
+
+        def troca_srcset(m):
+            partes = []
+            for parte in m.group(2).split(","):
+                p = parte.strip().split()
+                if not p:
+                    continue
+                l = acha_local(p[0]) if not p[0].startswith(
+                    ("http", "//", "data:", "assets/", "\x00")) else None
+                if l:
+                    n_rel[0] += 1
+                    p[0] = l
+                partes.append(" ".join(p))
+            return m.group(1) + ", ".join(partes) + m.group(3)
+
+        html = re.sub(r'((?:srcset|data-srcset)\s*=\s*")([^"]*)(")',
+                      troca_srcset, html)
+
+        def troca_url_css(m):
+            u = m.group(1).strip("'\" ")
+            if u.startswith(("http", "//", "data:", "assets/", "\x00")):
+                return m.group(0)
+            l = acha_local(u)
+            if not l:
+                return m.group(0)
+            n_rel[0] += 1
+            return "url(" + l + ")"
+
+        html = re.sub(r"url\(([^)]+)\)", troca_url_css, html)
+        if n_rel[0]:
+            n += n_rel[0]
+            diga("refs relativas resolvidas contra a URL da página: %d" % n_rel[0])
+
         # âncoras que apontam para a própria página
         base_page = page_url.split("#")[0]
         html, k = re.subn(re.escape(base_page) + r"#", "#", html)
@@ -1364,6 +1533,27 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
     triagem = {}          # preenchido pela triagem antes de montar()
 
     def montar(html):
+        # Comentário HTML sai INTEIRO do clone, sempre. Dois motivos:
+        # não serve para nada num clone, e um <script> comentado quebra o
+        # pareamento do regex — o </script> de dentro do comentário fecha o
+        # par errado e o tracker REAL logo depois vira "corpo" do casamento
+        # anterior, escapando da limpeza. Foi assim que o gtag da Melara Max
+        # passou. Mascarar aqui e descartar no fim resolve os dois.
+        n_com = [0]
+
+        def _guarda(m):
+            n_com[0] += 1
+            return "\x00COM\x00"
+
+        html = re.sub(r"<!--.*?-->", _guarda, html, flags=re.S)
+
+        def _devolve(h):
+            h = h.replace("\x00COM\x00", "")
+            h = re.sub(r"<!--.*?-->", "", h, flags=re.S)   # os que nós criamos
+            if n_com[0]:
+                diga("comentários HTML removidos: %d" % n_com[0])
+            return h
+
         mortos = []
         if not a.manter_trackers:
             def mata(m):
@@ -1406,7 +1596,7 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
 
             js_saiu, js_fica = _junta(True), _junta(False)
             html, n_ns = re.subn(r"<noscript><iframe[^>]*(?:googletagmanager|facebook)[^>]*>.*?</noscript>",
-                                 "<!-- tracker noscript removido -->", html, flags=re.S)
+                                 "", html, flags=re.S)
 
             # pixels são <img>/<iframe>, não <script>: bloquear só o download
             # deixaria a tag apontando para o rastreador e ela dispararia igual.
@@ -1511,13 +1701,27 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
 
             # (1) Reescrita estática do href dos <a> que trocam de página / são
             #     externos (mantém âncoras internas), para o hover mostrar o link.
+            # Numa pre-sell, TODA saída vai para a oferta. Só fica quem
+            # não sai: âncora que aponta para um id que existe na página
+            # (rolagem, accordion do Bootstrap) e o seletor de idioma.
+            # "javascript:void(0)" e "#" pelado NÃO são âncoras — são o
+            # placeholder clássico de botão que navega por JS, e era por
+            # onde os CTAs escapavam mudos.
+            ids = set(re.findall(r'\bid="([^"]+)"', html))
+            ids |= set(re.findall(r'\bname="([^"]+)"', html))
+
+            def ancora_viva(h):
+                if sem_ancoras:
+                    return False          # nem rolagem interna sobrevive
+                return len(h) > 1 and h.startswith("#") and h[1:] in ids
+
             def troca_a(m):
                 tag = m.group(0)
-                if "data-clone-lang" in tag:
-                    return tag           # seletor de idioma: navegação interna
+                if "data-clone-lang" in tag or "data-clone-ui" in tag:
+                    return tag           # seletor de idioma / peça nossa
                 h = re.search(r'href="([^"]*)"', tag)
-                if h and (h.group(1).startswith("#") or h.group(1).startswith("javascript:")):
-                    return tag                       # âncora interna / js: preserva
+                if h and ancora_viva(h.group(1)):
+                    return tag                       # rolagem na própria página
                 if h:
                     tag = re.sub(r'href="[^"]*"', 'href="%s"' % alvo, tag, count=1)
                 else:
@@ -1531,8 +1735,8 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
 
             # (2) Snippet: sobrescreve funções de troca de página, intercepta
             #     cliques que levam a outra página e o submit de formulários.
-            html = html.replace("</body>", link_snippet(link) + "\n</body>", 1) \
-                if "</body>" in html else html + link_snippet(link)
+            html = html.replace("</body>", link_snippet(link, sem_ancoras) + "\n</body>", 1) \
+                if "</body>" in html else html + link_snippet(link, sem_ancoras)
 
         if redirect:
             # depois da limpeza: entra no fim do <body> para rodar por último
@@ -1542,26 +1746,26 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
             else:
                 html += snip
             diga("REDIRECT: todo clique -> %s" % redirect)
-        return html
+        if not a.manter_trackers and not permitir_externos:
+            html, cx, doms = neutraliza_externos(html)
+            if cx:
+                diga("chamadas externas cortadas: %s  [%s]"
+                     % (", ".join("%s=%d" % kv for kv in sorted(cx.items())),
+                        ", ".join(doms[:6]) + ("…" if len(doms) > 6 else "")))
+        return _devolve(html)
 
     html = relocalizar(html)
 
     # ── 3b. idiomas ───────────────────────────────────────────────
-    # Todo clone sai com seletor de idioma próprio: um botão flutuante
-    # isolado em Shadow DOM, que não depende do frontend da página.
+    # Regra: o clone oferece EXATAMENTE os idiomas que a página oferecia, e
+    # quem controla a troca é o seletor que ela já tem. Página sem seletor
+    # não ganha sistema de idioma nenhum — nada de botão injetado, nada de
+    # tradução para idioma que o site não tinha.
     #
-    #   --idiomas "pt-br,en,de"  -> o PRIMEIRO é o padrão, e os três ficam
-    #                               disponíveis para trocar no site.
-    #
-    # A página clonada tem o idioma que tem (o <html lang>). Todo idioma
-    # pedido que não seja esse precisa de dicionário, e ele vem, nesta ordem:
-    #   1. da versão que o servidor de origem devolveu (capturar.js as busca);
-    #   2. de i18n/<código>.json já na pasta (cache de rodadas anteriores);
-    #   3. traduzido na hora pelo CLI do Claude, e salvo como cache.
+    # A troca passa a ser na hora, sem recarregar: o seletor original
+    # mandava para ?lang=xx, que num clone estático só devolveria a mesma
+    # página. Aqui ele passa a reescrever o texto pelo dicionário.
     vindos = {k.lower(): v for k, v in (d.get("idiomas") or {}).items()}
-    # O idioma da página vem SEMPRE da própria página: é o que o HTML
-    # declara. --idioma-origem existe só para o caso raro de o site declarar
-    # errado (acontece: template em inglês com lang="pt-br" esquecido).
     if idioma_origem:
         base_lang = normaliza_codigo(idioma_origem)
         if not base_lang:
@@ -1570,49 +1774,39 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
     else:
         base_lang, origem_de = idioma_da_pagina(html)
         if not base_lang:
-            # o HTML não declarou: pergunta ao texto dele, não a um chute
             base_lang, origem_de = idioma_da_pagina(
                 html, amostra=sorted(set(segmentos(html).textos)))
         if not base_lang:
             sys.exit("ERRO: a página não declara idioma e não deu para "
                      "detectar.\n      Passe --idioma-origem <sigla>.")
 
-    pedidos = [c.strip().lower().replace("_", "-") for c in idiomas.split(",") if c.strip()]
-    ruins = [c for c in pedidos if not valida_codigo(c)]
-    if ruins:
-        sys.exit("ERRO: sigla de idioma inválida: %s\n"
-                 "      Use código BCP-47: pt-br, en, de, ja, zh-hans, ar, sw…"
-                 % ", ".join(ruins))
-    pedidos = list(dict.fromkeys(pedidos))       # sem repetir, ordem mantida
-    # o primeiro da lista manda; --idioma continua valendo como atalho
-    padrao = (idioma or (pedidos[0] if pedidos else "") or base_lang).lower()
-    oferecidos = pedidos or sorted(vindos) or [base_lang]
-    if padrao not in oferecidos:
-        oferecidos.insert(0, padrao)
-    oferecidos = [padrao] + [c for c in oferecidos if c != padrao]
-
+    traduzidos = sorted(c for c, v in vindos.items()
+                        if c != base_lang and v.get("html"))
     pasta_i18n = os.path.join(out, "i18n")
     dicio, fonte = {}, {}
-    base_para_dic = html            # antes de qualquer injeção nossa
+    base_para_dic = html
 
-    if not sem_idiomas:
-        # (1) versões traduzidas que vieram na captura
-        for c, v in sorted(vindos.items()):
-            if c == base_lang or c not in oferecidos or not v.get("html"):
-                continue
-            dic, cont = dicionario_da_variante(base_para_dic, v["html"])
-            if dic:
+    if sem_idiomas or not traduzidos:
+        html = montar(html)
+        if not traduzidos:
+            print("idiomas: a página é só em %s (%s) — sem seletor no HTML, "
+                  "nada a oferecer" % (base_lang, origem_de))
+    else:
+        # (1) as versões que o próprio servidor devolveu traduzidas
+        for c in traduzidos:
+            dic, cob = dicionario_da_variante(base_para_dic, vindos[c]["html"])
+            if cob >= 0.5 and dic:
                 dicio[c], fonte[c] = dic, "origem"
             else:
-                print("   idioma %s: %d vs %d segmentos — template diferente, "
-                      "vai por tradução" % (c, cont[0], cont[1]))
-
-        # (2) cache em disco
+                print("   %-9s só %.0f%% casou com a página" % (c, cob * 100))
+        # (2) dicionário à mão / cache de rodada anterior
         if os.path.isdir(pasta_i18n):
             for fn in sorted(os.listdir(pasta_i18n)):
                 if not fn.endswith(".json") or fn.startswith("_"):
                     continue
                 c = fn[:-5].lower()
+                if c not in traduzidos:
+                    continue
                 try:
                     m = json.load(io.open(os.path.join(pasta_i18n, fn), encoding="utf-8"))
                 except Exception as e:
@@ -1624,41 +1818,17 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                     dicio.setdefault(c, {}).update(m)
                     fonte[c] = "origem+arquivo" if fonte.get(c) == "origem" else "arquivo"
 
-    # ── 3a-bis. triagem: o que as listas não decidiram ────────────
-    if not manter_trackers and not sem_triagem:
-        indecisos = coletar_indecisos(html, local2url, assets)
-        if indecisos:
-            v = triagem_scripts(indecisos)
-            triagem.update(v)
-            fora = [(it["id"], v[it["id"]]) for it in indecisos
-                    if v.get(it["id"], {}).get("classe") == "rastreamento"]
-            print("triagem: %d script(s) sem regra -> %d rastreamento, %d mantidos"
-                  % (len(indecisos), len(fora), len(indecisos) - len(fora)))
-            for chave, reg in fora:
-                print("   FORA  %s  (%s)" % (chave[:60], reg.get("porque", "")))
-            for it in indecisos:
-                reg = v.get(it["id"], {})
-                if reg.get("classe") != "rastreamento":
-                    print("   fica  %-46s (%s: %s)"
-                          % (it["id"][:46], reg.get("classe", "?"),
-                             reg.get("porque", "")))
-
-    if sem_idiomas:
-        html = montar(html)
-    else:
-        html, n_marc = marcar_idiomas(html, set(oferecidos) | set(vindos))
+        html, n_marc = marcar_idiomas(html, set(traduzidos) | {base_lang})
         html = montar(html)
         os.makedirs(pasta_i18n, exist_ok=True)
 
-        # (3) o que ainda falta, traduzido agora
-        base = segmentos(html)      # já limpo: sem sobra de tracker
+        base = segmentos(html)
         termos = sorted(set(base.textos) | set(base.atributos) |
                         ({base.titulo} if base.titulo else set()))
-        io.open(os.path.join(pasta_i18n, "_base.json"), "w", encoding="utf-8").write(
-            json.dumps({t: "" for t in termos}, ensure_ascii=False, indent=1))
 
-        pendentes = [c for c in oferecidos
-                     if c != base_lang and len(dicio.get(c, {})) < len(termos) * 0.6]
+        # (3) o site oferece o idioma mas o alinhamento não deu: traduz
+        pendentes = [c for c in traduzidos
+                     if len(dicio.get(c, {})) < len(termos) * 0.5]
         if pendentes and not sem_traduzir:
             print("traduzindo %d termos de %s para: %s"
                   % (len(termos), base_lang, ", ".join(pendentes)))
@@ -1667,44 +1837,40 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
                 novo_dic = traduzir_termos(falta, base_lang, c)
                 if novo_dic:
                     dicio.setdefault(c, {}).update(novo_dic)
-                    fonte[c] = "traduzido" if fonte.get(c) is None else fonte[c] + "+traduzido"
+                    fonte[c] = "traduzido" if not fonte.get(c) else fonte[c] + "+traduzido"
                     io.open(os.path.join(pasta_i18n, c + ".json"), "w",
                             encoding="utf-8").write(json.dumps(
                                 dicio[c], ensure_ascii=False, indent=1, sort_keys=True))
-        elif pendentes:
-            print("   sem dicionário (--sem-traduzir): %s" % ", ".join(pendentes))
 
-        codigos = [c for c in oferecidos if c == base_lang or dicio.get(c)]
+        codigos = [base_lang] + [c for c in traduzidos if dicio.get(c)]
         n_js, peso, embutido = escrever_i18n(pasta_i18n, base_lang, dicio, codigos)
 
-        # dicionário antes do widget, widget antes do --link: quem registra
-        # o clique primeiro ganha a troca de idioma.
-        snip = ('<script src="i18n/dicionarios.js"></script>\n'
-                + i18n_snippet(padrao, idioma_pos, idioma_auto))
-        marca_link = '<script data-clone="link">'
-        if marca_link in html:
-            html = html.replace(marca_link, snip + "\n" + marca_link, 1)
-        elif "</body>" in html:
-            html = html.replace("</body>", snip + "\n</body>", 1)
+        if n_marc < 2:
+            print("!! o HTML oferece %d idiomas mas não achei o seletor deles "
+                  "na página." % len(traduzidos))
+            print("   Sem controle, a troca não teria como acontecer — "
+                  "sistema de idioma desligado.")
+            codigos = [base_lang]
         else:
-            html += snip
-
-        print("idiomas: página em %s (%s) | padrão %s | no seletor: %s%s"
-              % (base_lang, origem_de, padrao, ", ".join(codigos),
-                 " | %d opções nativas religadas" % n_marc if n_marc else ""))
-        print("   dicionários: %.0f KB %s"
-              % (peso / 1024.0,
-                 "embutidos na página" if embutido
-                 else "em arquivo por idioma, buscados no clique"))
-        for c in codigos:
-            if c == base_lang:
-                print("   %-9s %4d termos (texto original da página)" % (c, len(termos)))
+            snip = ('<script src="i18n/dicionarios.js"></script>\n'
+                    + i18n_snippet())
+            marca_link = '<script data-clone="link">'
+            if marca_link in html:
+                html = html.replace(marca_link, snip + "\n" + marca_link, 1)
+            elif "</body>" in html:
+                html = html.replace("</body>", snip + "\n</body>", 1)
             else:
+                html += snip
+            print("idiomas: %d do próprio site, no seletor da própria página "
+                  "(%d elementos religados)" % (len(codigos), n_marc))
+            print("   %-9s %4d termos (texto original, %s)"
+                  % (base_lang, len(termos), origem_de))
+            for c in codigos[1:]:
                 print("   %-9s %4d/%d termos (%s)"
                       % (c, len(dicio[c]), len(termos), fonte.get(c, "?")))
-        fora = [c for c in oferecidos if c not in codigos]
-        if fora:
-            print("   FORA do seletor (sem dicionário): %s" % ", ".join(fora))
+            print("   dicionários: %.0f KB %s"
+                  % (peso / 1024.0, "embutidos" if embutido
+                     else "em arquivo por idioma, buscados no clique"))
 
     io.open(os.path.join(out, "index.html"), "w",
             encoding="utf-8", errors="surrogatepass").write(html)
@@ -1828,6 +1994,23 @@ def reconstruir(d, nome=None, offline=False, manter_trackers=False, bloquear="",
 
     tot = sum(os.path.getsize(os.path.join(assets, f)) for f in os.listdir(assets))
     print("\ntamanho: %.1f MB em %d arquivos" % (tot / 1048576, len(os.listdir(assets))))
+    # Ficha do clone: quando saiu, de onde, com que link. Sem isto não dá
+    # para saber se o que está no ar é o clone recém-feito ou um antigo —
+    # dúvida que já custou tempo nesta bancada.
+    ficha = {
+        "origem": page_url,
+        "quando": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "link_afiliado": link or "",
+        "idioma_base": locals().get("base_lang", ""),
+        "idiomas": locals().get("codigos", []),
+        "assets": len(os.listdir(assets)) if os.path.isdir(assets) else 0,
+        "faltando": len(faltando),
+        "externos": sorted(vivos_fora) if "vivos_fora" in locals() else [],
+        "comando": " ".join(sys.argv[1:]),
+    }
+    io.open(os.path.join(out, ".clone.json"), "w", encoding="utf-8").write(
+        json.dumps(ficha, ensure_ascii=False, indent=1))
+
     print("\nservir com:  ./servir.py %s" % nome)
 
 
@@ -1841,28 +2024,24 @@ def main():
                     help="só marca os rastreadores (type=text/plain) em vez de removê-los")
     ap.add_argument("--link", default="", metavar="URL",
                     help="troca o href de todos os <a> por esta URL (só os <a>)")
-    ap.add_argument("--idioma", default="", metavar="COD",
-                    help="atalho: força o idioma padrão. Normalmente basta pôr ele "
-                         "em primeiro na lista de --idiomas")
-    ap.add_argument("--idiomas", default="", metavar="LISTA",
-                    help="idiomas disponíveis no seletor, separados por vírgula. "
-                         "O PRIMEIRO é o padrão do clone. Ex.: pt-br,en,de")
     ap.add_argument("--idioma-origem", default="", metavar="COD",
                     help="idioma em que a página capturada está "
                          "(padrão: o <html lang> dela)")
+    ap.add_argument("--permitir-externos", action="store_true",
+                    help="deixa a página buscar de fora o que sobrou (o padrão "
+                         "é cortar: um clone não telefona para ninguém)")
     ap.add_argument("--sem-triagem", action="store_true",
                     help="não usa a LLM para julgar os scripts que as listas "
                          "não decidem (mantém todos, como antes)")
     ap.add_argument("--sem-traduzir", action="store_true",
                     help="não chama o Claude para traduzir o que faltar; usa só "
                          "o que veio da captura e os i18n/<cod>.json existentes")
-    ap.add_argument("--idioma-pos", default="bl", choices=sorted(CANTOS),
-                    help="canto do botão flutuante: bl/br/tl/tr (padrão bl)")
-    ap.add_argument("--idioma-auto", action="store_true",
-                    help="na 1ª visita, abre no idioma do navegador se houver "
-                         "dicionário (padrão: abre sempre em --idioma)")
     ap.add_argument("--sem-idiomas", action="store_true",
-                    help="não injeta o seletor de idioma")
+                    help="ignora os idiomas do site; entrega só o original")
+    ap.add_argument("--sem-ancoras", action="store_true",
+                    help="manda para o link até os <a href=\"#secao\"> que só "
+                         "rolam a própria página (padrão: rolagem interna fica, "
+                         "porque não tira o visitante da página)")
     ap.add_argument("--redirect", default="", metavar="URL",
                     help="(avançado) intercepta todo clique de CTA e leva a esta URL")
     ap.add_argument("--so-frontend", action="store_true",
@@ -1879,11 +2058,11 @@ def main():
     reconstruir(json.load(open(a.json)), a.nome,
                 offline=a.offline, manter_trackers=a.manter_trackers,
                 bloquear=a.bloquear, marcar=a.marcar, redirect=a.redirect,
-                so_frontend=a.so_frontend, link=a.link,
-                idioma=a.idioma, idiomas=a.idiomas, idioma_pos=a.idioma_pos,
-                sem_idiomas=a.sem_idiomas, idioma_auto=a.idioma_auto,
+                so_frontend=a.so_frontend, link=a.link, sem_ancoras=a.sem_ancoras,
+                sem_idiomas=a.sem_idiomas,
                 idioma_origem=a.idioma_origem, sem_traduzir=a.sem_traduzir,
-                sem_triagem=a.sem_triagem)
+                sem_triagem=a.sem_triagem,
+                permitir_externos=a.permitir_externos)
 
 
 if __name__ == "__main__":
