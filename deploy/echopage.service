@@ -1,0 +1,30 @@
+[Unit]
+Description=echopage — clonador de páginas
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=echopage
+Group=echopage
+WorkingDirectory=/opt/echopage
+EnvironmentFile=/etc/echopage.env
+ExecStart=/usr/bin/python3 /opt/echopage/painel.py 7000
+Restart=always
+RestartSec=5
+
+# O Chrome precisa de /tmp e de escrever no perfil; o resto fica trancado.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/echopage /var/lib/echopage
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# uma captura pesada come memória; sem teto ela derruba a VPS
+MemoryMax=3G
+TasksMax=800
+
+[Install]
+WantedBy=multi-user.target

@@ -157,6 +157,22 @@ os dois casos.
 
 ---
 
+## Numa VPS
+
+Backend na VPS, frontend na Vercel: veja [`deploy/`](deploy/README.md).
+
+O `deploy/instalar.sh` põe Chrome, Xvfb e o serviço systemd de pé e gera um
+token — a API **não pode** ficar aberta, porque quem alcançar a porta manda o
+servidor baixar qualquer site.
+
+Dois pontos que decidem se vale a pena:
+
+- **HTTPS é obrigatório.** A página na Vercel é HTTPS e o navegador bloqueia
+  chamada para API em HTTP puro. Precisa de domínio apontando para a VPS.
+- **IP de datacenter é tratado pior pelo Cloudflare.** Parte do motivo de isto
+  funcionar na sua máquina é o IP residencial. Teste com os sites que te
+  interessam antes de migrar.
+
 ## Limites conhecidos
 
 - **A captura precisa do Chrome.** Não existe caminho por `curl`: páginas atrás

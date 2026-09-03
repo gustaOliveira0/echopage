@@ -25,6 +25,13 @@ RAIZ = os.path.dirname(os.path.abspath(__file__))
 CLONES = os.path.join(RAIZ, "clones")
 CAPTURAS = os.path.join(RAIZ, ".capturas")
 ZIPS = os.path.join(RAIZ, ".zips")
+
+# Em servidor a API fica exposta: quem alcançar a porta manda o navegador
+# baixar qualquer site. Token obrigatório sempre que ECHOPAGE_TOKEN existir.
+TOKEN = os.environ.get("ECHOPAGE_TOKEN", "").strip()
+# Com o frontend na Vercel, a origem é outra: sem CORS o navegador barra.
+ORIGENS = [o.strip().rstrip("/") for o in
+           os.environ.get("ECHOPAGE_ORIGENS", "").split(",") if o.strip()]
 PORTA = 7000
 
 MIME = {
@@ -412,10 +419,65 @@ class Painel(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # ── acesso ────────────────────────────────────────────────────
+    def _origem_ok(self):
+        o = (self.headers.get("Origin") or "").rstrip("/")
+        if not o:
+            return None                     # mesma origem: sem CORS
+        if not ORIGENS or o in ORIGENS:
+            return o
+        return False
+
+    def _cors(self, o):
+        if o:
+            self.send_header("Access-Control-Allow-Origin", o)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Credentials", "false")
+
+    def _autorizado(self):
+        if not TOKEN:
+            return True                     # sem token configurado: local
+        dado = (self.headers.get("Authorization") or "")
+        if dado.startswith("Bearer "):
+            dado = dado[7:]
+        else:
+            dado = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query).get("t", [""])[0]
+        # comparação de tempo constante: o token não vaza por cronometragem
+        import hmac
+        return hmac.compare_digest(dado.strip(), TOKEN)
+
+    def _barra(self):
+        o = self._origem_ok()
+        if o is False:
+            self._envia('{"erro":"origem não permitida"}', "application/json", 403)
+            return True
+        if not self._autorizado():
+            corpo = b'{"erro":"token invalido"}'
+            self.send_response(401)
+            self._cors(o)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
+            return True
+        return False
+
+    def do_OPTIONS(self):
+        o = self._origem_ok()
+        self.send_response(204)
+        self._cors(o or "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _envia(self, corpo, tipo="text/html; charset=utf-8", codigo=200):
         if isinstance(corpo, str):
             corpo = corpo.encode("utf-8")
         self.send_response(codigo)
+        self._cors(self._origem_ok() or None)
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(corpo)))
         self.end_headers()
@@ -423,8 +485,12 @@ class Painel(BaseHTTPRequestHandler):
 
     def do_GET(self):
         cam = urllib.parse.urlsplit(self.path)
+        if cam.path in ("/saude", "/health"):
+            return self._envia('{"ok":true}', "application/json")
         if cam.path == "/":
             return self._envia(PAGINA)
+        if self._barra():
+            return
         if cam.path == "/api/clones":
             return self._envia(json.dumps(lista_clones()), "application/json")
         if cam.path == "/api/log":
@@ -441,7 +507,9 @@ class Painel(BaseHTTPRequestHandler):
         if not t:
             return self._envia("sem tarefa", "text/plain", 404)
         self.send_response(200)
+        self._cors(self._origem_ok() or None)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("X-Accel-Buffering", "no")   # nginx não pode bufferizar SSE
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -524,6 +592,8 @@ class Painel(BaseHTTPRequestHandler):
         self._envia(corpo, MIME.get(ext, "text/plain; charset=utf-8"))
 
     def do_POST(self):
+        if self._barra():
+            return
         rota = urllib.parse.urlsplit(self.path).path
         if rota == "/api/configurar":
             return self._configurar()
@@ -551,8 +621,13 @@ class Painel(BaseHTTPRequestHandler):
 
 def main():
     porta = int(sys.argv[1]) if len(sys.argv) > 1 else PORTA
-    s = ThreadingHTTPServer(("127.0.0.1", porta), Painel)
-    print("echopage em http://localhost:%d/   (Ctrl+C para parar)" % porta, flush=True)
+    host = os.environ.get("ECHOPAGE_HOST", "127.0.0.1")
+    s = ThreadingHTTPServer((host, porta), Painel)
+    print("echopage em http://%s:%d/   (Ctrl+C para parar)" % (host, porta), flush=True)
+    if TOKEN:
+        print("token    : exigido (ECHOPAGE_TOKEN)", flush=True)
+    if ORIGENS:
+        print("origens  : %s" % ", ".join(ORIGENS), flush=True)
     try:
         s.serve_forever()
     except KeyboardInterrupt:
