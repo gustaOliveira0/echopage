@@ -50,11 +50,12 @@ links `<a>` para uma URL fornecida.
    ./clonar.py captura.json nome --link "<url>" --idiomas "pt-br,en,de"
    ```
 
-   O botão de troca é injetado pelo clonador — a página pode ter um seletor
-   ou não. É um botão flutuante isolado em Shadow DOM, responsivo, que não
-   depende do CSS nem do JS do site. A troca é na hora, trocando o texto pelo
-   dicionário: sem recarregar, sem query string, sem servidor, sem chamada
-   externa. A escolha do visitante fica no `localStorage`.
+   **Quem troca o idioma é o seletor que a página já tem** — o clonador não
+   injeta botão nenhum. Ele só marca as opções nativas com `data-clone-lang`
+   e passa a escutar o clique (e o `change`, quando o seletor é um `<select>`).
+   A troca é na hora, trocando o texto pelo dicionário: sem recarregar, sem
+   query string, sem servidor, sem chamada externa. A escolha do visitante
+   fica no `localStorage`.
 
    **O idioma de origem vem sempre da própria página**, nesta ordem: `lang`
    do `<html>`, `xml:lang`, `<meta http-equiv="content-language">`,
@@ -159,8 +160,7 @@ ou baixa o `.zip`. Os scripts abaixo são as peças que ele orquestra.
   `<iframe>` 1x1 invisível é beacon por forma, venha de onde vier.
   Opções de idioma: `--idiomas a,b,c` (disponíveis; o 1º é o padrão),
   `--idioma-origem <cod>` (idioma da página capturada), `--sem-traduzir`,
-  `--idioma-pos bl|br|tl|tr` (canto do botão), `--idioma-auto` (1ª visita
-  segue o navegador), `--sem-idiomas`.
+  `--sem-idiomas`.
 
 - **`servir.py <nome> [porta]`** — serve em localhost com os MIME types certos
   (webp, webm, fontes).
@@ -175,8 +175,8 @@ caminhos relativos e editável à mão.
 
 Abrir `file:///home/gustavo/clonador-paginas/clones/<nome>/index.html` e checar:
 - visual idêntico ao original;
-- o botão flutuante de idioma abre e cada opção troca o texto na hora,
-  inclusive no celular (largura estreita);
+- o seletor de idioma da própria página troca o texto na hora, inclusive no
+  celular (largura estreita);
 - FAQ abrindo ao clicar, cronômetro correndo, sliders/animações rodando;
 - ao passar o mouse nos `<a>`, a barra de status mostra a URL fornecida.
 

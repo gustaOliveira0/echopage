@@ -176,10 +176,10 @@ def redirect_snippet(dest):
 
 # ══════════════════════════════════════════════════════════════════
 #  IDIOMAS
-#  Todo clone sai com um seletor de idioma próprio, injetado, que não
-#  depende do frontend da página: um botão flutuante isolado em Shadow
-#  DOM. A troca acontece na hora, trocando o texto pelo dicionário —
-#  sem recarregar, sem query string, sem servidor, sem chamada externa.
+#  O controle é o seletor que a página já tem: nada de botão injetado.
+#  As opções nativas ganham data-clone-lang e o clique passa a ser nosso.
+#  A troca acontece na hora, trocando o texto pelo dicionário — sem
+#  recarregar, sem query string, sem servidor, sem chamada externa.
 # ══════════════════════════════════════════════════════════════════
 IDIOMAS_NOME = {
     "pt-br": "Português (Brasil)", "pt": "Português", "en": "English",
