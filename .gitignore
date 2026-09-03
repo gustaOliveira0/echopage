@@ -7,3 +7,5 @@ clones/
 __pycache__/
 *.pyc
 .veredictos.json
+.capturas/
+.zips/
