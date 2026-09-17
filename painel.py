@@ -119,9 +119,12 @@ def roda(tid, url, link, visivel, proxy="", conferir=True):
     def executa(cmd, rotulo):
         diz(rotulo, "etapa")
         diz("$ " + " ".join(cmd[1:]), "cmd")
+        # Sem PYTHONUNBUFFERED o filho, escrevendo num pipe, guarda a saída
+        # em bloco: o log ao vivo ficava mudo os 15 minutos da captura.
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, bufsize=1, cwd=RAIZ,
-                             stdin=subprocess.DEVNULL)
+                             stdin=subprocess.DEVNULL,
+                             env=dict(os.environ, PYTHONUNBUFFERED="1"))
         t["proc"] = p
         for linha in p.stdout:
             diz(linha.rstrip("\n"))
@@ -158,9 +161,16 @@ def roda(tid, url, link, visivel, proxy="", conferir=True):
         if executa(cmd, "2/2 · Limpando, removendo tracking e montando") != 0:
             raise RuntimeError("a montagem falhou")
 
-        shutil.rmtree(destino, ignore_errors=True)
+        # A captura FICA. Ela é a matéria-prima, e é o passo caro e frágil:
+        # depende de Chrome, de VPN e de passar pelo Cloudflare. Apagá-la
+        # obrigava a capturar tudo de novo só para remontar o clone com uma
+        # correção do clonador — e num site geobloqueado isso pode não ter
+        # segunda chance. Guardamos a última de cada site; a anterior já foi
+        # removida ali em cima, antes desta captura começar.
         t["estado"] = "pronto"
         diz("/c/%s/" % nome, "pronto")
+        diz("captura guardada em .capturas/%s/ — dá para remontar o clone "
+            "sem capturar de novo" % nome)
     except Exception as e:
         t["estado"] = "erro"
         diz(str(e), "erro")
@@ -460,6 +470,13 @@ class Painel(BaseHTTPRequestHandler):
         else:
             dado = urllib.parse.parse_qs(
                 urllib.parse.urlsplit(self.path).query).get("t", [""])[0]
+        if not dado:
+            # Um clone aberto em /c/<nome>/?t=… pede dezenas de assets por
+            # caminho relativo, e nenhum deles leva o ?t=. O cookie que a
+            # primeira resposta grava é o que os deixa passar.
+            m = re.search(r"(?:^|;\s*)echopage_t=([^;]+)",
+                          self.headers.get("Cookie") or "")
+            dado = urllib.parse.unquote(m.group(1)) if m else ""
         # comparação de tempo constante: o token não vaza por cronometragem
         import hmac
         return hmac.compare_digest(dado.strip(), TOKEN)
@@ -495,6 +512,9 @@ class Painel(BaseHTTPRequestHandler):
             corpo = corpo.encode("utf-8")
         self.send_response(codigo)
         self._cors(self._origem_ok() or None)
+        if getattr(self, "_cookie", ""):
+            self.send_header("Set-Cookie", self._cookie)
+            self._cookie = ""
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(corpo)))
         self.end_headers()
@@ -516,6 +536,10 @@ class Painel(BaseHTTPRequestHandler):
             n = urllib.parse.parse_qs(cam.query).get("nome", [""])[0]
             return self._zip(re.sub(r"[^A-Za-z0-9._-]", "", n))
         if cam.path.startswith("/c/"):
+            if TOKEN and "t=" in cam.query:
+                self._cookie = ("echopage_t=%s; Path=/c/; Max-Age=86400; "
+                                "HttpOnly; Secure; SameSite=Lax"
+                                % urllib.parse.quote(TOKEN, safe=""))
             return self._clone(urllib.parse.unquote(cam.path[3:]))
         self._envia("não encontrado", "text/plain; charset=utf-8", 404)
 

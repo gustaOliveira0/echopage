@@ -97,6 +97,12 @@ class Chrome:
         self.ws = WS(v["webSocketDebuggerUrl"], timeout=timeout)
         self.n = 0
         self.versao = v.get("Browser", "?")
+        # Por padrão o evento que chega enquanto um comando espera resposta é
+        # descartado — é o que o eventos_ate() espera (só evento NOVO). Quem
+        # precisa responder a evento (Fetch.requestPaused, na sonda de
+        # cliques) liga a guarda e lê com drenar().
+        self.guardar = False
+        self.eventos = []
 
     def cmd(self, metodo, params=None, sessao=None, espera=180):
         self.n += 1
@@ -111,7 +117,14 @@ class Chrome:
                 if "error" in r:
                     raise RuntimeError("%s: %s" % (metodo, r["error"].get("message")))
                 return r.get("result", {})
+            if self.guardar and "method" in r and len(self.eventos) < 5000:
+                self.eventos.append(r)
         raise TimeoutError("sem resposta para %s" % metodo)
+
+    def drenar(self):
+        """Devolve (e esquece) os eventos guardados desde a última drenagem."""
+        ev, self.eventos = self.eventos, []
+        return ev
 
     def eventos_ate(self, nome, sessao=None, espera=60):
         fim = time.time() + espera

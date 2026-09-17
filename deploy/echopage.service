@@ -22,8 +22,12 @@ ReadWritePaths=/opt/echopage /var/lib/echopage
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-# uma captura pesada come memória; sem teto ela derruba a VPS
-MemoryMax=3G
+# uma captura pesada come memória; sem teto ela derruba a VPS. Numa máquina
+# de 2 GB o teto tem de caber na RAM: MemoryHigh freia e recupera antes, e o
+# swap do instalador absorve o pico em vez de o kernel matar a captura.
+MemoryHigh=1400M
+MemoryMax=1800M
+MemorySwapMax=4G
 TasksMax=800
 
 [Install]

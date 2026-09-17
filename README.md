@@ -120,6 +120,13 @@ de ouro — e o veredicto fica em cache por hash, julgado uma vez para sempre.
 idiomas que ela oferecia, e o **botão original dela** passa a trocar o texto na
 hora, sem recarregar. Página de um idioma só não ganha nada.
 
+**Em que idioma abre, quem decide é o lugar do visitante.** Quem acessa dos
+EUA abre em inglês, do Brasil em português — sem clicar em nada, e só entre os
+idiomas que o clone tem. A decisão sai do fuso horário do próprio navegador,
+antes de desenhar: **a página não espera rede nenhuma para abrir**. Quem trocar
+o idioma à mão manda a partir daí. `--geo-ip` acrescenta a confirmação por IP
+em segundo plano, para tráfego com muita VPN; `--sem-geo` desliga.
+
 ---
 
 ## Arquivos

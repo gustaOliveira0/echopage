@@ -15,7 +15,7 @@ O Chrome usado é um perfil dedicado em ~/.clonador-chrome, separado do seu
 navegador do dia a dia. Ele guarda os cookies entre as rodadas, então o
 clearance do Cloudflare de um site já visitado é reaproveitado.
 """
-import argparse, glob, json, os, shutil, subprocess, sys, time
+import argparse, glob, json, os, re, shutil, subprocess, sys, time
 from urllib.request import urlopen
 
 RAIZ = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +23,29 @@ sys.path.insert(0, RAIZ)
 from cdp import Chrome                                          # noqa: E402
 from clonar import diagnostica_pagina                           # noqa: E402
 import proxyauth                                                # noqa: E402
+
+# Roda ANTES de qualquer script da página, em todo documento novo.
+# O Chrome guarda só 250 entradas de resource-timing e descarta o resto sem
+# avisar; numa landing de 400 arquivos, o que cai fora é o fim da fila — as
+# imagens e o vídeo. O observador abaixo anota cada recurso numa lista sem
+# teto, que o capturar.js soma ao buffer do navegador.
+PREAMBULO = """
+(function () {
+  try { performance.setResourceTimingBufferSize(20000); } catch (e) {}
+  window.__CLONE_RES = [];
+  try {
+    new PerformanceObserver(function (l) {
+      var es = l.getEntries();
+      for (var i = 0; i < es.length; i++) window.__CLONE_RES.push(es[i].name);
+    }).observe({ type: 'resource', buffered: true });
+  } catch (e) {}
+  try {
+    addEventListener('resourcetimingbufferfull', function () {
+      try { performance.clearResourceTimings(); } catch (e) {}
+    });
+  } catch (e) {}
+})();
+"""
 
 PERFIL = os.path.expanduser("~/.clonador-chrome")
 PERFIL_ATUAL = PERFIL
@@ -191,6 +214,234 @@ def ip_visto(c, sess):
     return {}
 
 
+def completar_do_terminal(arq, page_url, teto_mb=120):
+    """Baixa por fora do navegador o que o fetch de dentro dele não leu.
+
+    O vídeo dessas páginas mora num domínio à parte (video.<site>), e um
+    fetch cross-origin sem cabeçalho de CORS volta como erro: o navegador
+    BAIXA o vídeo para tocar na tela, mas recusa entregar os bytes ao
+    JavaScript. Foi assim que os 8 vídeos da Fungabeam sumiram do clone sem
+    uma linha de aviso — no log da captura eles são só "ERR", que parece
+    falha de rede e não é.
+
+    Aqui a mesma URL é buscada pelo Python, que não tem CORS nenhum. Só o
+    que falhou por erro (não o que respondeu 404/403: aí quem não tem é a
+    origem). Tracker fica de fora, e o que continuar falhando permanece no
+    log, para a conferência saber de quem é a ausência.
+    """
+    import base64 as _b64
+    from urllib.request import Request, urlopen
+    try:
+        d = json.load(open(arq, encoding="utf-8"))
+    except Exception as e:
+        print("aviso  : não deu para reabrir a captura (%s)" % e)
+        return
+    from clonar import eh_tracker                                # noqa: E402
+    pendentes, novos = [], {}
+    for l in d.get("log", []):
+        if not (l.startswith("ERR ") or l.startswith("vazio ")):
+            continue
+        u = l.split(" ", 1)[1].strip()
+        if not u.startswith(("http://", "https://")) or u in d.get("files", {}):
+            continue
+        if eh_tracker(u):
+            continue
+        pendentes.append((l, u))
+    if not pendentes:
+        return
+    print("resgate: %d arquivo(s) que o navegador não pôde ler (CORS) — "
+          "buscando pelo terminal" % len(pendentes))
+    cab = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+           "Referer": page_url, "Accept": "*/*"}
+    trocas, bytes_ = {}, 0
+    for l, u in pendentes:
+        try:
+            r = urlopen(Request(u, headers=cab), timeout=90)
+            dados = r.read(teto_mb * 1048576 + 1)
+            if not dados or len(dados) > teto_mb * 1048576:
+                continue
+            novos[u] = {"b64": _b64.b64encode(dados).decode(),
+                        "type": r.headers.get("content-type", ""),
+                        "size": len(dados)}
+            trocas[l] = "TERMINAL " + u
+            bytes_ += len(dados)
+            print("         + %-42s %.1f MB"
+                  % (u.split("/")[-1][:42], len(dados) / 1048576.0))
+        except Exception:
+            continue
+    if not novos:
+        print("         nenhum veio — a ausência é da origem")
+        return
+    d["files"].update(novos)
+    d["log"] = [trocas.get(l, l) for l in d.get("log", [])]
+    tmp = arq + ".novo"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, arq)
+    print("resgate: %d arquivo(s), %.1f MB somados à captura"
+          % (len(novos), bytes_ / 1048576.0))
+
+
+def _avalia(c, sess, expr, espera=60):
+    r = c.cmd("Runtime.evaluate", {"expression": expr, "awaitPromise": True,
+                                   "returnByValue": True}, sessao=sess, espera=espera)
+    if "exceptionDetails" in r:
+        return None
+    return r.get("result", {}).get("value")
+
+
+def sondar_cliques(c, sess, alvo, arq, page_url, teto_s=150, teto_n=90):
+    """Clica em cada botão da página, com a saída trancada, e anota o efeito.
+
+    Nome e classe não dizem o que um botão faz. Na Guardality, o "Load
+    More" das avaliações tem a classe "cta" e só abre a lista, e o joinha
+    do comentário é um <button> que só troca o ícone — o filtro por nome
+    mandava os dois para a oferta, e a página perdia a interface. Aqui
+    quem responde é a própria página: clique confiável (o mesmo evento de
+    um visitante), navegação barrada em três camadas (API navigate na
+    página, Fetch no documento principal, janela nova fechada) e um
+    observador de mutações que desconta o que muda sozinho.
+
+    De brinde, o que o clique carrega entra na captura: o ícone do joinha
+    ativo só existe depois do clique, e nenhuma varredura o encontraria.
+    """
+    js = open(os.path.join(RAIZ, "sondar.js"), encoding="utf-8").read()
+
+    def injeta():
+        c.cmd("Runtime.evaluate", {"expression": js}, sessao=sess)
+        return _avalia(c, sess, "__sonda.listar()") or []
+
+    try:
+        frame = c.cmd("Page.getFrameTree", sessao=sess)["frameTree"]["frame"]["id"]
+    except Exception:
+        frame = alvo
+    lista = injeta()
+    if not lista:
+        return
+    print("cliques: sondando %d botão(ões) distintos, com a saída trancada"
+          % min(len(lista), teto_n))
+    c.guardar = True
+    c.drenar()
+    c.cmd("Fetch.enable", {"patterns": [{"urlPattern": "*", "resourceType": "Document",
+                                         "requestStage": "Request"}]}, sessao=sess)
+    try:
+        c.cmd("Target.setDiscoverTargets", {"discover": True})
+    except Exception:
+        pass
+    _avalia(c, sess, "__sonda.ruidoGlobal(2500)")
+
+    def trata_eventos():
+        saiu = False
+        for ev in c.drenar():
+            m, pr = ev.get("method"), ev.get("params", {})
+            if m == "Fetch.requestPaused":
+                if pr.get("frameId") == frame and pr.get("resourceType") == "Document":
+                    saiu = True
+                    c.cmd("Fetch.failRequest", {"requestId": pr["requestId"],
+                                                "errorReason": "Aborted"}, sessao=sess)
+                else:
+                    c.cmd("Fetch.continueRequest", {"requestId": pr["requestId"]},
+                          sessao=sess)
+            elif m == "Target.targetCreated":
+                t = pr.get("targetInfo", {})
+                if t.get("openerId") == alvo and t.get("type") == "page":
+                    saiu = True
+                    try:
+                        c.cmd("Target.closeTarget", {"targetId": t["targetId"]})
+                    except Exception:
+                        pass
+        return saiu
+
+    acoes, novos, fim = [], set(), time.time() + teto_s
+    conta = {"ui": 0, "saida": 0, "nada": 0}
+    for item in lista[:teto_n]:
+        if time.time() > fim:
+            print("         tempo da sonda esgotado — o resto fica com a regra por nome")
+            break
+        k = json.dumps(item["k"])
+
+        def um_clique():
+            prep = _avalia(c, sess, "__sonda.preparar(%s)" % k)
+            if not prep or not prep.get("ok"):
+                return False
+            if prep.get("clicavel"):
+                x, y = prep["x"], prep["y"]
+                for tipo in ("mouseMoved", "mousePressed", "mouseReleased"):
+                    c.cmd("Input.dispatchMouseEvent",
+                          {"type": tipo, "x": x, "y": y, "button": "left",
+                           "clickCount": 0 if tipo == "mouseMoved" else 1}, sessao=sess)
+            else:
+                _avalia(c, sess, "__sonda.clicarJs()")
+            return _avalia(c, sess, "__sonda.colher()")
+
+        res = um_clique()
+        if res is False:
+            continue
+        saiu = trata_eventos()
+        if res and not saiu and res.get("v") == "ui" and res.get("fora"):
+            # só mudou um carrossel que não contém o botão: pode ser o
+            # autoplay coincidindo. Interface de verdade repete o efeito.
+            res2 = um_clique()
+            saiu = trata_eventos()
+            if res2 and res2.get("v") != "ui" and not saiu:
+                res = dict(res, v="nada")
+        if res is None or _avalia(c, sess, "!!window.__sonda") is not True:
+            # a página foi embora apesar das travas: volta e segue do próximo
+            saiu = True
+            c.cmd("Page.navigate", {"url": page_url}, sessao=sess, espera=60)
+            time.sleep(4)
+            trata_eventos()
+            injeta()
+            _avalia(c, sess, "__sonda.ruidoGlobal(1500)")
+            res = res or {}
+        v = "saida" if saiu else res.get("v", "nada")
+        conta[v] = conta.get(v, 0) + 1
+        a = dict(item["a"])
+        a["v"] = v
+        acoes.append(a)
+        novos.update(res.get("novos") or [])
+
+    try:
+        c.cmd("Fetch.disable", sessao=sess)
+    except Exception:
+        pass
+    c.guardar = False
+    print("         interface: %d · saída: %d · sem efeito: %d"
+          % (conta["ui"], conta["saida"], conta["nada"]))
+
+    try:
+        d = json.load(open(arq, encoding="utf-8"))
+    except Exception as e:
+        print("aviso  : não deu para reabrir a captura (%s)" % e)
+        return
+    from clonar import eh_tracker                                # noqa: E402
+    midia = re.compile(r"\.(png|jpe?g|gif|webp|avif|svg|ico|mp4|webm|ogv|mov|m4v|"
+                       r"mp3|m4a|wav|woff2?|ttf|otf|css)(\?|#|$)", re.I)
+    faltam = [u for u in sorted(novos)
+              if u.startswith(("http://", "https://")) and u not in d["files"]
+              and (midia.search(u) or not eh_tracker(u))]
+    trazidos = 0
+    for i in range(0, len(faltam), 8):
+        lote = faltam[i:i + 8]
+        got = _avalia(c, sess, "__sonda.baixar(%s)" % json.dumps(lote), espera=180) or {}
+        for u, f in got.items():
+            if f.get("b64"):
+                d["files"][u] = f
+                d.setdefault("log", []).append("CLIQUE " + u)
+                trazidos += 1
+            else:
+                d.setdefault("log", []).append("ERR " + u)
+    if trazidos:
+        print("         %d arquivo(s) que só o clique carrega entraram na captura"
+              % trazidos)
+    d["acoes"] = acoes
+    tmp = arq + ".novo"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, arq)
+
+
 def capturar(url, destino, porta=PORTA, visivel=False, espera=900, rolagem=25,
              perfil=None, xvfb=False, proxy="", conferir_ip=False,
              mesmo_assim=False, pais=""):
@@ -231,6 +482,9 @@ def capturar(url, destino, porta=PORTA, visivel=False, espera=900, rolagem=25,
               {"behavior": "allow", "downloadPath": destino, "eventsEnabled": True})
         c.cmd("Page.enable", sessao=sess)
         c.cmd("Runtime.enable", sessao=sess)
+        # antes de navegar: é a única hora em que dá para ver o começo
+        c.cmd("Page.addScriptToEvaluateOnNewDocument",
+              {"source": PREAMBULO}, sessao=sess)
         if conferir_ip or pais:
             i = ip_visto(c, sess)
             cc = (i.get("pais") or i.get("cc") or "").upper()
@@ -318,17 +572,40 @@ def capturar(url, destino, porta=PORTA, visivel=False, espera=900, rolagem=25,
               sessao=sess)
 
         fim, ultimo = time.time() + espera, None
+        inicio = time.time() - 5
+        # O Chrome 153 da VPS ignorou o Browser.setDownloadBehavior e largou o
+        # .json na pasta de downloads padrão: a captura tinha terminado em 3
+        # minutos e o terminal esperou os 15 olhando para a pasta vazia. O
+        # que cair lá depois do início desta captura é nosso — vem para cá.
+        padrao = os.path.join(os.path.expanduser("~"), "Downloads")
         while time.time() < fim:
             time.sleep(2)
+            for f in glob.glob(os.path.join(padrao, "captura-*.json")):
+                if os.path.getmtime(f) >= inicio:
+                    t1 = os.path.getsize(f)
+                    time.sleep(1.5)
+                    if os.path.getsize(f) == t1 and t1 > 0:
+                        shutil.move(f, os.path.join(destino, os.path.basename(f)))
+                        print("        o Chrome baixou em %s — trazido para a "
+                              "pasta da captura" % padrao)
+            parciais_padrao = glob.glob(os.path.join(padrao, "*.crdownload"))
             novos = [f for f in glob.glob(os.path.join(destino, "*.json"))
                      if f not in antes]
-            parciais = glob.glob(os.path.join(destino, "*.crdownload"))
+            parciais = (glob.glob(os.path.join(destino, "*.crdownload"))
+                        + parciais_padrao)
             if novos and not parciais:
                 t1, t2 = os.path.getsize(novos[0]), None
                 time.sleep(1.5)
                 t2 = os.path.getsize(novos[0])
                 if t1 == t2 and t1 > 0:
                     print("pronto : %s (%.1f MB)" % (novos[0], t1 / 1048576.0))
+                    try:
+                        sondar_cliques(c, sess, alvo, novos[0], url)
+                    except Exception as e:
+                        c.guardar = False
+                        print("aviso  : a sonda de cliques falhou (%s) — os "
+                              "botões ficam com a regra por nome" % e)
+                    completar_do_terminal(novos[0], url)
                     return novos[0]
             if parciais and parciais[0] != ultimo:
                 ultimo = parciais[0]
@@ -392,6 +669,10 @@ def main():
     if not a.url:
         sys.exit("ERRO: faltou o link da página.")
 
+    # O Chrome recém-aberto às vezes derruba a conexão de depuração antes da
+    # primeira resposta ("conexão fechada"). Não é a página nem a rede: é o
+    # navegador ainda se acomodando, e na segunda tentativa passa. Perder uma
+    # captura inteira por isso não faz sentido, então tenta de novo uma vez.
     try:
         arq = capturar(a.url, a.saida, a.porta, a.visivel, a.espera,
                        perfil=a.perfil or None, xvfb=a.xvfb,
@@ -400,6 +681,16 @@ def main():
     except (RuntimeError, TimeoutError) as e:
         # erro esperado (bloqueio, desafio, tempo): mensagem, não traceback
         sys.exit("ERRO: %s" % e)
+    except OSError as e:
+        print("chrome : a conexão de depuração caiu (%s) — tentando de novo" % e)
+        time.sleep(3)
+        try:
+            arq = capturar(a.url, a.saida, a.porta, a.visivel, a.espera,
+                           perfil=a.perfil or None, xvfb=a.xvfb,
+                           proxy=a.proxy, conferir_ip=a.conferir_ip,
+                           mesmo_assim=a.mesmo_assim, pais=a.pais)
+        except (RuntimeError, TimeoutError) as e2:
+            sys.exit("ERRO: %s" % e2)
     if a.clonar:
         cmd = [sys.executable, os.path.join(RAIZ, "clonar.py"), arq, a.clonar]
         if a.link:

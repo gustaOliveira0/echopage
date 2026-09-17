@@ -34,6 +34,77 @@ LIXO = re.compile(r"[\$\{\}<>+`\\]|\s")
 EXTERNO = re.compile(r"^(?:https?:|//|data:|blob:|about:|mailto:|tel:|javascript:|#|chrome-extension:)", re.I)
 
 
+# Assinatura dos bytes: o que o arquivo É, contra o que o nome dele diz.
+# Só formatos binários entram — nenhuma destas casa com HTML, CSS ou JS, e é
+# isso que mantém o fragmento de checkout servido por um `.php` como texto.
+ASSINATURAS = [
+    (b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"), (b"GIF89a", ".gif"),
+    (b"\x00\x00\x01\x00", ".ico"),
+    (b"wOFF", ".woff"), (b"wOF2", ".woff2"),
+    (b"\x00\x01\x00\x00", ".ttf"), (b"OTTO", ".otf"),
+    (b"\x1a\x45\xdf\xa3", ".webm"), (b"%PDF", ".pdf"), (b"OggS", ".ogg"),
+    (b"ID3", ".mp3"),
+]
+IGUAIS = [{".jpg", ".jpeg", ".jfif"}, {".tif", ".tiff"}, {".mp4", ".m4v"}]
+
+
+def tipo_real(dados):
+    """A extensão que os BYTES pedem — ou "" quando eles não dizem nada."""
+    if not dados:
+        return ""
+    for assin, ext in ASSINATURAS:
+        if dados.startswith(assin):
+            return ext
+    if dados[4:8] == b"ftyp":
+        return ".avif" if dados[8:12].lower().startswith(b"avi") else ".mp4"
+    if dados[:4] == b"RIFF" and dados[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+FAMILIA = {}
+for _ext, _fam in [
+        (".png .jpg .jpeg .jfif .gif .webp .avif .bmp .ico", "imagem"),
+        (".svg", "vetor"), (".woff .woff2 .ttf .otf .eot", "fonte"),
+        (".mp4 .m4v .webm .ogv .mov", "video"),
+        (".mp3 .ogg .wav .m4a", "audio"), (".pdf", "documento")]:
+    for _e in _ext.split():
+        FAMILIA[_e] = _fam
+
+
+def extensao_errada(caminho_ou_ext, dados):
+    """A extensão certa, quando a atual esconde o arquivo do navegador.
+
+    Devolve "" quando a troca não muda nada na tela. Entre formatos de
+    imagem rasterizada o navegador fareja e mostra assim mesmo — um WEBP
+    chamado `.png` aparece, e são 36 arquivos assim na Guardality, todos
+    visíveis: cobrar isso seria alarme falso. O que quebra é mudar de
+    FAMÍLIA, e o caso clássico é o SVG, que não se fareja: ou chega como
+    XML válido ou não é nada. O PNG de 1017x1017 chamado `moneyback.svg`
+    virava `image/svg+xml` e sumia — calado, porque o arquivo existia e a
+    conferência de referências passava.
+    """
+    ext = os.path.splitext(caminho_ou_ext)[1].lower() or caminho_ou_ext.lower()
+    real = tipo_real(dados)
+    if not real or not ext or real == ext:
+        return ""
+    if any({real, ext} <= g for g in IGUAIS):
+        return ""
+    if FAMILIA.get(ext) and FAMILIA.get(ext) == FAMILIA.get(real):
+        return ""                      # o navegador fareja e mostra
+    return real if FAMILIA.get(ext) else ""
+
+
+def tipo_mente(caminho):
+    """A extensão deste arquivo do disco esconde o conteúdo dele?"""
+    try:
+        with open(caminho, "rb") as f:
+            return extensao_errada(caminho, f.read(64))
+    except Exception:
+        return ""
+
+
 def local(u):
     """Devolve o caminho local que essa referência aponta, ou None."""
     u = (u or "").strip()
@@ -150,21 +221,39 @@ def conferir(pasta, quieto=False, origem_404=None, ficha=None, link=None):
     # ── 2. toda referência local, de todo HTML e todo CSS ─────────
     # A resolução é relativa AO ARQUIVO que cita — é isso que a auditoria
     # antiga não fazia, e por isso um url() dentro de assets/x.css passava.
+    #
+    # Entra aqui também o FRAGMENTO: o checkout destas páginas não está no
+    # index.html, ele chega por AJAX como um pedaço de markup servido de um
+    # .php — e é ele que traz os <img> do formulário (bandeira de cartão,
+    # cadeado, selo de desconto). Como o pedaço é injetado DENTRO do
+    # index.html, as referências dele resolvem contra a raiz do clone, não
+    # contra a pasta assets/ onde o arquivo mora. Sem isto o clone ficava
+    # com as imagens no disco e o formulário quebrado, e a conferência não
+    # via nada, porque só olhava .html e .css.
     arquivos = []
     for d, _, fs in os.walk(pasta):
         for f in fs:
             e = f.lower()
-            if e.endswith((".html", ".htm", ".css")):
-                arquivos.append(os.path.join(d, f))
+            if e.endswith((".html", ".htm")):
+                arquivos.append((os.path.join(d, f), "html", d))
+            elif e.endswith(".css"):
+                arquivos.append((os.path.join(d, f), "css", d))
+            elif e.endswith((".php", ".inc", ".tpl", ".txt")) or "." not in f:
+                q = os.path.join(d, f)
+                try:
+                    t = io.open(q, encoding="utf-8", errors="replace").read(400000)
+                except Exception:
+                    continue
+                if re.search(r"<(?:img|link|form|source)\b", t, re.I):
+                    arquivos.append((q, "html", pasta))
 
     faltando, vistas = {}, 0
-    for p in sorted(arquivos):
+    for p, modo, base in sorted(arquivos):
         try:
             t = io.open(p, encoding="utf-8", errors="replace").read()
         except Exception:
             continue
-        base = os.path.dirname(p)
-        gera = refs_css(t) if p.lower().endswith(".css") else refs_html(t)
+        gera = refs_css(t) if modo == "css" else refs_html(t)
         for bruto, rotulo in gera:
             c = local(bruto)
             if c is None:
@@ -189,9 +278,30 @@ def conferir(pasta, quieto=False, origem_404=None, ficha=None, link=None):
 
     # ── 3. chamadas externas automáticas ──────────────────────────
     fora = set()
-    for p in arquivos:
+    for p, _modo, _base in arquivos:
         if p.lower().endswith((".html", ".htm")):
             fora |= externos(io.open(p, encoding="utf-8", errors="replace").read())
+
+    # O idioma de entrada é decidido no navegador (fuso horário), sem
+    # rede. Sobra, quando declarada, a confirmação por IP: ela mora no
+    # cabeçalho do dicionário, o clonador a pôs de propósito e pergunta
+    # uma coisa só — de que país é este IP. Some da lista de falhas e
+    # aparece à parte, como os 404 de origem. `/cdn-cgi/trace` nem
+    # conta: é same-origin.
+    geo_api, geo_paises, geo_fusos = [], 0, 0
+    dicjs = os.path.join(pasta, "i18n", "dicionarios.js")
+    if os.path.exists(dicjs):
+        t = io.open(dicjs, encoding="utf-8", errors="replace").read(400000)
+        m = re.search(r'"geoapi"\s*:\s*\[(.*?)\]', t, re.S)
+        if m:
+            geo_api = re.findall(r'"([^"]+)"', m.group(1))
+        m = re.search(r'"geo"\s*:\s*\{(.*?)\}', t, re.S)
+        if m:
+            geo_paises = len(re.findall(r'"[A-Z]{2}"\s*:', m.group(1)))
+        m = re.search(r'"tz"\s*:\s*\{(.*?)\n \}', t, re.S)
+        if m:
+            geo_fusos = len(re.findall(r'"[A-Za-z_]+/', m.group(1)))
+    fora -= {urlsplit(u).netloc for u in geo_api if u.startswith("http")}
 
     # ── 4. <a> apontando para o link de afiliado ──────────────────
     html = io.open(index, encoding="utf-8", errors="replace").read()
@@ -234,6 +344,19 @@ def conferir(pasta, quieto=False, origem_404=None, ficha=None, link=None):
         for alvo, (onde, bruto, rotulo) in sorted(da_origem.items()):
             diz("      %-46s  <- %s" % (alvo[:46], onde))
 
+    mentindo = {}
+    if os.path.isdir(assets):
+        for f in sorted(os.listdir(assets)):
+            certa = tipo_mente(os.path.join(assets, f))
+            if certa:
+                mentindo[f] = certa
+    if mentindo:
+        problemas.append("%d arquivo(s) com extensão errada" % len(mentindo))
+        diz("   [FALHA] %d arquivo(s) não são o que a extensão diz — o "
+            "navegador não mostra:" % len(mentindo))
+        for f, certa in sorted(mentindo.items()):
+            diz("      %-46s  é %s" % (f[:46], certa))
+
     diz("\n-- CHAMADAS EXTERNAS AUTOMÁTICAS")
     if fora:
         problemas.append("%d domínio(s) chamado(s) ao abrir" % len(fora))
@@ -242,6 +365,11 @@ def conferir(pasta, quieto=False, origem_404=None, ficha=None, link=None):
             diz("      -", dom)
     else:
         diz("   [OK] nenhuma — o clone não telefona para ninguém")
+    fone = [u for u in geo_api if u.startswith("http")]
+    if fone:
+        diz("   (declarada: confirma o país do IP em segundo plano, para o")
+        diz("    idioma de entrada — %s; a página não espera por ela)"
+            % ", ".join(urlsplit(u).netloc for u in fone))
 
     diz("\n-- LINKS E IDIOMA")
     if destino:
@@ -259,6 +387,11 @@ def conferir(pasta, quieto=False, origem_404=None, ficha=None, link=None):
     else:
         diz("   <a>: %d (clone sem --link; nada a conferir)" % len(hrefs))
     diz("   opções de idioma marcadas (data-clone-lang): %d" % idioma)
+    if idioma:
+        diz("   idioma de entrada: %s"
+            % ("pelo lugar do visitante, decidido no navegador "
+               "(%d fusos, %d países)" % (geo_fusos, geo_paises)
+               if geo_paises else "fixo, o primeiro da lista"))
 
     diz("")
     if problemas:
@@ -269,7 +402,9 @@ def conferir(pasta, quieto=False, origem_404=None, ficha=None, link=None):
     return problemas, {"refs": vistas, "faltando": len(nossos),
                        "faltando_lista": sorted(nossos),
                        "faltando_origem": sorted(da_origem),
-                       "externos": sorted(fora), "assets": n_assets}
+                       "tipo_errado": mentindo,
+                       "externos": sorted(fora), "assets": n_assets,
+                       "geo_paises": geo_paises, "geo_fusos": geo_fusos}
 
 
 def main():

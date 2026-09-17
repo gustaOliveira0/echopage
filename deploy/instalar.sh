@@ -23,7 +23,11 @@ fi
 google-chrome --version
 
 echo "── 3. código ──"
-if [ -d "$DESTINO/.git" ]; then
+# O deploy/enviar.sh já deixou a pasta aqui por rsync — inclusive o que ainda
+# não foi commitado. Só busca no GitHub quem não tem código nenhum.
+if [ -f "$DESTINO/painel.py" ] && [ ! -d "$DESTINO/.git" ]; then
+  echo "código já enviado por rsync"
+elif [ -d "$DESTINO/.git" ]; then
   git -C "$DESTINO" pull --ff-only
 else
   git clone --depth 1 https://github.com/gustaOliveira0/echopage.git "$DESTINO"
@@ -31,6 +35,18 @@ fi
 mkdir -p "$DESTINO"/{clones,.capturas,.zips}
 id -u echopage >/dev/null 2>&1 || useradd -r -m -d /var/lib/echopage -s /usr/sbin/nologin echopage
 chown -R echopage:echopage "$DESTINO" /var/lib/echopage
+
+echo "── 3b. swap ──"
+# 2 GB de RAM não seguram o Chrome numa landing pesada; sem swap o kernel
+# mata a captura no meio. 4 GB de arquivo custam disco, e disco tem 50 GB.
+if [ ! -f /swapfile ] && [ "$(free -m | awk '/^Swap:/{print $2}')" -lt 1024 ]; then
+  fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+free -h | awk '/^Swap:/{print "swap: "$2}'
 
 echo "── 4. token ──"
 CONF=/etc/echopage.env
